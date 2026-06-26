@@ -116,4 +116,11 @@ def price_monitor():
         
         if data:
             last_price = data['price']
-           
+            last_price_time = time.time()
+        
+        time.sleep(120)  # проверка каждые 2 минуты
+
+threading.Thread(target=price_monitor, daemon=True).start()
+
+print("Бот запущен...")
+bot.polling(none_stop=True)
