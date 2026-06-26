@@ -8,8 +8,7 @@ TOKEN = "8838571832:AAElqHv_qPr8EUY42vJh0EQBQDU7rAGqfRg"
 
 bot = telebot.TeleBot(TOKEN)
 
-# Настройки подписок на изменение цены
-price_subscribers = {}  # chat_id: порог в процентах (1, 2 или 5)
+price_subscribers = {}  # chat_id: порог (%)
 
 last_price = 0
 last_price_time = time.time()
@@ -21,14 +20,10 @@ def get_hype_data():
         data = response.json()
         
         price = data['market_data']['current_price']['usd']
-        volume_24h = data['market_data']['total_volume']['usd']
+        volume = data['market_data']['total_volume']['usd']
         change_24h = data['market_data']['price_change_percentage_24h']
         
-        return {
-            'price': price,
-            'volume': volume_24h,
-            'change_24h': change_24h
-        }
+        return {'price': price, 'volume': volume, 'change_24h': change_24h}
     except:
         return None
 
@@ -41,20 +36,19 @@ def start(message):
     markup.add("🔔 Настроить уведомления по цене", "❌ Отписаться")
     
     bot.send_message(message.chat.id, 
-                     "👋 Добро пожаловать в бот мониторинга **HYPE**\n\n"
-                     "Выберите действие:", 
+                     "👋 Бот мониторинга **HYPE**\n\nВыберите действие:", 
                      reply_markup=markup)
 
 @bot.message_handler(commands=['clear'])
 def clear(message):
-    bot.send_message(message.chat.id, "🧹 Переписка очищена (насколько это возможно в Telegram).")
-    start(message)  # возвращаем главное меню
+    bot.send_message(message.chat.id, "🧹 Чат очищен.")
+    start(message)
 
 @bot.message_handler(func=lambda m: True)
 def handle_text(message):
     data = get_hype_data()
     if not data:
-        bot.send_message(message.chat.id, "❌ Не удалось получить данные. Попробуйте позже.")
+        bot.send_message(message.chat.id, "❌ Не удалось получить данные.")
         return
 
     if message.text == "💰 Курс HYPE":
@@ -71,40 +65,50 @@ def handle_text(message):
         markup.add(types.InlineKeyboardButton("1% за 10 минут", callback_data="price_1"))
         markup.add(types.InlineKeyboardButton("2% за 10 минут", callback_data="price_2"))
         markup.add(types.InlineKeyboardButton("5% за 10 минут", callback_data="price_5"))
-        bot.send_message(message.chat.id, "При каком изменении цены за ~10 минут присылать уведомление?", reply_markup=markup)
+        
+        bot.send_message(message.chat.id, 
+                         "При каком изменении цены за ~10 минут присылать уведомление?", 
+                         reply_markup=markup)
 
     elif message.text == "❌ Отписаться":
         price_subscribers.pop(message.chat.id, None)
-        bot.send_message(message.chat.id, "✅ Вы отписались от уведомлений по цене.")
+        bot.send_message(message.chat.id, "✅ Вы отписались от уведомлений.")
 
-# Обработка кнопок
+# ==================== ОБРАБОТКА КНОПОК ====================
+
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    bot.answer_callback_query(call.id)
-    chat_id = call.message.chat.id
-    
-    if call.data.startswith("price_"):
+    try:
+        bot.answer_callback_query(call.id)  # обязательно
+        
+        chat_id = call.message.chat.id
         threshold = int(call.data.split("_")[1])
+        
         price_subscribers[chat_id] = threshold
-        bot.send_message(chat_id, f"✅ Уведомления включены!\nБуду оповещать при изменении цены на **{threshold}%** за 10 минут.")
+        
+        bot.send_message(chat_id, 
+                         f"✅ Уведомления включены!\n\n"
+                         f"Буду присылать оповещение при изменении цены на **{threshold}%** за 10 минут.")
+        
+    except Exception as e:
+        print(f"Callback error: {e}")
 
-# ==================== МОНИТОРИНГ ЦЕНЫ ====================
+# ==================== МОНИТОРИНГ ====================
 
 def price_monitor():
     global last_price, last_price_time
-    
     while True:
         data = get_hype_data()
         if data and last_price > 0:
             price_change = abs((data['price'] - last_price) / last_price * 100)
-            time_diff = (time.time() - last_price_time) / 60  # минуты
+            minutes_passed = (time.time() - last_price_time) / 60
             
-            if time_diff <= 15:  # около 10-15 минут
+            if minutes_passed <= 15:  # ~10-15 минут
                 for chat_id, threshold in list(price_subscribers.items()):
                     if price_change >= threshold:
                         alert = f"⚡ **ИЗМЕНЕНИЕ ЦЕНЫ HYPE**\n\n" \
                                 f"Изменение за ~10 мин: **{price_change:.2f}%**\n" \
-                                f"Текущая цена: `${data['price']:.4f}`"
+                                f"Текущая цена: `${data['price']:.4f}` USD"
                         try:
                             bot.send_message(chat_id, alert)
                         except:
@@ -112,12 +116,4 @@ def price_monitor():
         
         if data:
             last_price = data['price']
-            last_price_time = time.time()
-        
-        time.sleep(120)  # проверка каждые 2 минуты
-
-# Запуск мониторинга
-threading.Thread(target=price_monitor, daemon=True).start()
-
-print("Бот запущен...")
-bot.polling(none_stop=True)
+           
