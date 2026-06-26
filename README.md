@@ -1,2 +1,2 @@
 # dollar-bot
-Telegram бот курса доллара
+Telegram бот
