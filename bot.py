@@ -11,37 +11,37 @@ import os
 from telebot import types
 
 # ── Токен ────────────────────────────────────────────────────
-# Лучше хранить в переменной окружения:
-#   export BOT_TOKEN="ваш_токен"
-# Если не задана — берём fallback (только для теста!)
 TOKEN = os.getenv("BOT_TOKEN", "8838571832:AAElqHv_qPr8EUY42vJh0EQBQDU7rAGqfRg")
-bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
+bot = telebot.TeleBot(TOKEN, parse_mode="Markdown", threaded=True)
 
-# ── Хранилище подписчиков ────────────────────────────────────
-# { chat_id: threshold_percent }
-price_subscribers: dict[int, int] = {}
+# ── Глобальный кэш последней цены (заполняется монитором) ────
+_cache_lock = threading.Lock()
+_latest: dict | None = None          # последние данные с CoinGecko
+_price_history: list = []            # [(price, timestamp), ...]
 
-# ── Хранилище базовой цены для каждого подписчика ───────────
-# { chat_id: (price, timestamp) }
-subscriber_base: dict[int, tuple[float, float]] = {}
+def get_cached() -> dict | None:
+    with _cache_lock:
+        return _latest
+
+# ── Хранилища подписчиков ────────────────────────────────────
+price_subscribers: dict[int, int] = {}    # chat_id -> порог %
+subscriber_base:   dict[int, float] = {}  # chat_id -> базовая цена
 
 # ── Главное меню ──────────────────────────────────────────────
-MAIN_MARKUP = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-MAIN_MARKUP.add(
-    types.KeyboardButton("💰 Курс HYPE"),
-    types.KeyboardButton("📊 Статистика 24ч"),
-)
-MAIN_MARKUP.add(
-    types.KeyboardButton("🔔 Уведомления"),
-    types.KeyboardButton("❌ Отписаться"),
-)
-MAIN_MARKUP.add(types.KeyboardButton("ℹ️ Помощь"))
+def main_markup():
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add("💰 Курс HYPE", "📊 Статистика 24ч")
+    m.add("🔔 Уведомления", "❌ Отписаться")
+    m.add("ℹ️ Помощь")
+    return m
 
-# ── CoinGecko ─────────────────────────────────────────────────
-def get_hype_data() -> dict | None:
+# ── CoinGecko (вызывается ТОЛЬКО из фонового потока) ─────────
+def _fetch_hype() -> dict | None:
     try:
-        url = "https://api.coingecko.com/api/v3/coins/hyperliquid"
-        r = requests.get(url, timeout=10)
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/coins/hyperliquid",
+            timeout=10,
+        )
         r.raise_for_status()
         d = r.json()["market_data"]
         return {
@@ -58,9 +58,9 @@ def get_hype_data() -> dict | None:
         return None
 
 def trend_emoji(change: float) -> str:
-    if change >= 3:   return "🚀"
-    if change >= 0:   return "📈"
-    if change >= -3:  return "📉"
+    if change >= 3:  return "🚀"
+    if change >= 0:  return "📈"
+    if change >= -3: return "📉"
     return "🔻"
 
 # ── /start ────────────────────────────────────────────────────
@@ -71,17 +71,17 @@ def cmd_start(message):
         "👋 *HYPE Monitor Bot*\n\n"
         "Слежу за ценой монеты *Hyperliquid (HYPE)* в реальном времени.\n\n"
         "Выбери действие на клавиатуре ниже 👇",
-        reply_markup=MAIN_MARKUP,
+        reply_markup=main_markup(),
     )
 
 # ── Курс ──────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "💰 Курс HYPE")
 def cmd_price(message):
-    data = get_hype_data()
+    data = get_cached()
     if not data:
-        bot.send_message(message.chat.id, "❌ Не удалось получить данные. Попробуй позже.")
+        bot.send_message(message.chat.id, "⏳ Данные ещё загружаются, подожди ~10 секунд.")
         return
-    em = trend_emoji(data["change_24h"])
+    em   = trend_emoji(data["change_24h"])
     sign = "+" if data["change_24h"] >= 0 else ""
     bot.send_message(
         message.chat.id,
@@ -95,18 +95,19 @@ def cmd_price(message):
 # ── Статистика ────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "📊 Статистика 24ч")
 def cmd_stats(message):
-    data = get_hype_data()
+    data = get_cached()
     if not data:
-        bot.send_message(message.chat.id, "❌ Не удалось получить данные. Попробуй позже.")
+        bot.send_message(message.chat.id, "⏳ Данные ещё загружаются, подожди ~10 секунд.")
         return
-    sign7 = "+" if data["change_7d"] >= 0 else ""
+    s7 = "+" if data["change_7d"] >= 0 else ""
+    s24 = "+" if data["change_24h"] >= 0 else ""
     bot.send_message(
         message.chat.id,
         f"📊 *Статистика HYPE*\n\n"
         f"Объём 24ч:       `${data['volume']:>15,.0f}`\n"
         f"Капитализация: `${data['cap']:>15,.0f}`\n\n"
-        f"Изм. 24ч: `{'+' if data['change_24h']>=0 else ''}{data['change_24h']:.2f}%`\n"
-        f"Изм. 7д:    `{sign7}{data['change_7d']:.2f}%`",
+        f"Изм. 24ч: `{s24}{data['change_24h']:.2f}%`\n"
+        f"Изм. 7д:    `{s7}{data['change_7d']:.2f}%`",
     )
 
 # ── Уведомления ───────────────────────────────────────────────
@@ -149,84 +150,83 @@ def cmd_help(message):
         "📊 *Статистика 24ч* — объём, капитализация, изменения\n"
         "🔔 *Уведомления* — оповещение при резком скачке цены\n"
         "❌ *Отписаться* — выключить уведомления\n\n"
-        "_Данные обновляются раз в 2 минуты (CoinGecko API)_",
+        "_Данные кэшируются и обновляются каждые 2 минуты_",
     )
 
-# ── Callback от инлайн-кнопок ────────────────────────────────
+# ── Callback — выбор порога (НЕ делает HTTP-запросов!) ────────
 @bot.callback_query_handler(func=lambda call: call.data.startswith("price_"))
 def cb_price_threshold(call):
-    bot.answer_callback_query(call.id)
+    # answer_callback_query — убирает "Загрузка..." МГНОВЕННО
+    bot.answer_callback_query(call.id, "✅ Сохранено!")
     try:
         threshold = int(call.data.split("_")[1])
         cid = call.message.chat.id
         price_subscribers[cid] = threshold
 
-        # Фиксируем базовую цену прямо сейчас
-        data = get_hype_data()
+        # Берём базовую цену из кэша — никаких HTTP-запросов
+        data = get_cached()
         if data:
-            subscriber_base[cid] = (data["price"], time.time())
+            subscriber_base[cid] = data["price"]
+            price_str = f"\n_Базовая цена: `${data['price']:.4f}`_"
+        else:
+            price_str = ""
 
         bot.send_message(
             cid,
             f"✅ *Уведомления включены!*\n\n"
-            f"Пришлю сигнал, если HYPE изменится на *{threshold}%* за 10 минут.\n"
-            f"_Базовая цена зафиксирована: ${data['price']:.4f}_" if data else
-            f"✅ Уведомления включены на {threshold}%.",
+            f"Пришлю сигнал, если HYPE изменится на *{threshold}%* за 10 минут.{price_str}",
         )
     except Exception as e:
         print(f"[Callback error] {e}")
+        bot.send_message(call.message.chat.id, "❌ Ошибка. Попробуй ещё раз.")
 
-# ── Неизвестный текст ─────────────────────────────────────────
+# ── Fallback ──────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: True)
 def fallback(message):
     bot.send_message(
         message.chat.id,
         "🤔 Не понял команду. Воспользуйся кнопками ниже.",
-        reply_markup=MAIN_MARKUP,
+        reply_markup=main_markup(),
     )
 
-# ── Монитор цены (фоновый поток) ─────────────────────────────
+# ── Фоновый монитор — единственный источник HTTP-запросов ─────
 def price_monitor():
-    """
-    Каждые 2 минуты проверяем цену.
-    Для каждого подписчика сравниваем с ценой, 
-    зафиксированной 10 минут назад (скользящее окно).
-    """
-    # Кольцевой буфер: последние 6 отсчётов (= 12 минут)
-    price_history: list[tuple[float, float]] = []  # (price, timestamp)
-
+    global _latest, _price_history
     while True:
-        data = get_hype_data()
+        data = _fetch_hype()
         now  = time.time()
 
         if data:
-            price_history.append((data["price"], now))
-            # Оставляем только записи за последние 15 минут
-            price_history = [(p, t) for p, t in price_history if now - t <= 900]
+            with _cache_lock:
+                _latest = data
+                _price_history.append((data["price"], now))
+                # храним только последние 15 минут
+                _price_history = [(p, t) for p, t in _price_history if now - t <= 900]
+                history_snap = list(_price_history)
 
+            # Проверяем подписчиков
             for cid, threshold in list(price_subscribers.items()):
-                base_price, base_time = subscriber_base.get(cid, (0, 0))
+                base = subscriber_base.get(cid, 0)
 
-                # Берём базу ~10 минут назад из истории
-                ten_min_ago = [p for p, t in price_history if 540 <= now - t <= 780]
-                if ten_min_ago:
-                    base_price = ten_min_ago[0]
+                # Если своей базы нет — берём запись ~10 мин назад из истории
+                if base == 0:
+                    candidates = [p for p, t in history_snap if 540 <= now - t <= 780]
+                    if candidates:
+                        base = candidates[0]
 
-                if base_price > 0:
-                    change_pct = (data["price"] - base_price) / base_price * 100
-
+                if base > 0:
+                    change_pct = (data["price"] - base) / base * 100
                     if abs(change_pct) >= threshold:
                         direction = "вырос 🚀" if change_pct > 0 else "упал 🔻"
                         alert = (
                             f"⚡ *СИГНАЛ: HYPE {direction}*\n\n"
                             f"Изменение за ~10 мин: `{change_pct:+.2f}%`\n"
-                            f"Цена сейчас: `${data['price']:.4f}`\n"
-                            f"Было ~10 мин назад: `${base_price:.4f}`"
+                            f"Цена сейчас:          `${data['price']:.4f}`\n"
+                            f"Было ~10 мин назад: `${base:.4f}`"
                         )
                         try:
                             bot.send_message(cid, alert)
-                            # После сигнала сдвигаем базу вперёд
-                            subscriber_base[cid] = (data["price"], now)
+                            subscriber_base[cid] = data["price"]
                         except Exception:
                             price_subscribers.pop(cid, None)
                             subscriber_base.pop(cid, None)
