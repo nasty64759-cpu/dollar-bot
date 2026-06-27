@@ -12,8 +12,17 @@ from telebot import types
 
 TOKEN = os.getenv("BOT_TOKEN", "8838571832:AAElqHv_qPr8EUY42vJh0EQBQDU7rAGqfRg")
 
-# threaded=True УБРАН — в некоторых версиях telebot он ломает callback
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
+
+# Сбрасываем вебхук и убиваем старые сессии при старте
+print("[Init] сброс вебхука и старых сессий...")
+try:
+    bot.remove_webhook()
+    time.sleep(1)
+    bot.get_updates(offset=-1)  # сбрасывает очередь
+    print("[Init] OK")
+except Exception as e:
+    print(f"[Init] ошибка сброса: {e}")
 
 # ── Глобальный кэш ───────────────────────────────────────────
 _cache_lock   = threading.Lock()
