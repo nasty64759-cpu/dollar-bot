@@ -16,18 +16,21 @@ TOKEN = os.getenv("BOT_TOKEN", "8838571832:AAElqHv_qPr8EUY42vJh0EQBQDU7rAGqfRg")
 print("[Init] завершение старых сессий...")
 for attempt in range(5):
     try:
-        # deleteWebhook с drop_pending_updates сбрасывает ВСЁ
         r = requests.get(
             f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
             params={"drop_pending_updates": True},
             timeout=10
         )
         print(f"[Init] deleteWebhook: {r.json()}")
-        time.sleep(2)  # ждём пока Telegram закроет старую сессию
         break
     except Exception as e:
         print(f"[Init] попытка {attempt+1} не удалась: {e}")
         time.sleep(3)
+
+# Ждём пока Railway убьёт старый контейнер (он живёт ~10-15 сек)
+print("[Init] ждём завершения старого контейнера...")
+time.sleep(15)
+print("[Init] готово, стартуем")
 
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 
@@ -247,12 +250,15 @@ def price_monitor():
 
 threading.Thread(target=price_monitor, daemon=True).start()
 
-# ── Запуск — с allow_sending_without_reply=True ───────────────
 print("✅ Бот запущен...")
 while True:
     try:
-        # skip_pending=True — пропускаем все накопленные апдейты
         bot.polling(none_stop=True, timeout=30, long_polling_timeout=20, skip_pending=True)
     except Exception as e:
-        print(f"[Polling error] {e} — перезапуск через 10с")
-        time.sleep(10)
+        err = str(e)
+        if "409" in err:
+            print("[Polling] 409 конфликт — ждём 20с пока старый процесс умрёт...")
+            time.sleep(20)
+        else:
+            print(f"[Polling error] {e} — перезапуск через 5с")
+            time.sleep(5)
