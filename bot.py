@@ -1,6 +1,5 @@
 # ============================================================
 #  HYPE Monitor Bot
-#  Зависимости: pip install pyTelegramBotAPI requests
 # ============================================================
 
 import telebot
@@ -12,22 +11,30 @@ from telebot import types
 
 TOKEN = os.getenv("BOT_TOKEN", "8838571832:AAElqHv_qPr8EUY42vJh0EQBQDU7rAGqfRg")
 
+# ── Убиваем старые сессии через прямой HTTP запрос ──────────
+# (до создания объекта TeleBot — иначе 409 при polling)
+print("[Init] завершение старых сессий...")
+for attempt in range(5):
+    try:
+        # deleteWebhook с drop_pending_updates сбрасывает ВСЁ
+        r = requests.get(
+            f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
+            params={"drop_pending_updates": True},
+            timeout=10
+        )
+        print(f"[Init] deleteWebhook: {r.json()}")
+        time.sleep(2)  # ждём пока Telegram закроет старую сессию
+        break
+    except Exception as e:
+        print(f"[Init] попытка {attempt+1} не удалась: {e}")
+        time.sleep(3)
+
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 
-# Сбрасываем вебхук и убиваем старые сессии при старте
-print("[Init] сброс вебхука и старых сессий...")
-try:
-    bot.remove_webhook()
-    time.sleep(1)
-    bot.get_updates(offset=-1)  # сбрасывает очередь
-    print("[Init] OK")
-except Exception as e:
-    print(f"[Init] ошибка сброса: {e}")
-
 # ── Глобальный кэш ───────────────────────────────────────────
-_cache_lock   = threading.Lock()
+_cache_lock = threading.Lock()
 _latest: dict | None = None
-_price_history: list = []   # [(price, timestamp)]
+_price_history: list = []
 
 def get_cached() -> dict | None:
     with _cache_lock:
@@ -120,64 +127,22 @@ def cmd_stats(message):
         f"Изм. 7д:    `{s7}{data['change_7d']:.2f}%`",
     )
 
-# ── Уведомления — показываем меню ────────────────────────────
+# ── Уведомления ───────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "🔔 Уведомления")
 def cmd_notify(message):
     current = price_subscribers.get(message.chat.id)
     note    = f"\n\n_Сейчас активно: {current}%_" if current else ""
-
-    markup = types.InlineKeyboardMarkup()
+    markup  = types.InlineKeyboardMarkup()
     markup.row(types.InlineKeyboardButton("⚡ 1%",  callback_data="p1"))
     markup.row(types.InlineKeyboardButton("🔥 2%",  callback_data="p2"))
     markup.row(types.InlineKeyboardButton("🚨 5%",  callback_data="p5"))
     markup.row(types.InlineKeyboardButton("💥 10%", callback_data="p10"))
-
     bot.send_message(
         message.chat.id,
         f"🔔 *Уведомления о резком движении цены*\n\n"
         f"Выбери порог изменения за ~10 минут:{note}",
         reply_markup=markup,
     )
-
-# ── Callback — МАКСИМАЛЬНО простой, без лишней логики ────────
-@bot.callback_query_handler(func=lambda call: call.data.startswith("p"))
-def cb_threshold(call):
-    print(f"[CB] получен callback: {call.data} от {call.message.chat.id}")
-
-    # Шаг 1 — СРАЗУ отвечаем Telegram, убираем "Загрузка..."
-    try:
-        bot.answer_callback_query(call.id)
-        print("[CB] answer_callback_query OK")
-    except Exception as e:
-        print(f"[CB] answer_callback_query FAILED: {e}")
-
-    # Шаг 2 — парсим порог
-    try:
-        threshold = int(call.data[1:])   # "p1" -> 1, "p10" -> 10
-    except Exception as e:
-        print(f"[CB] parse error: {e}")
-        return
-
-    cid = call.message.chat.id
-    price_subscribers[cid] = threshold
-
-    data = get_cached()
-    if data:
-        subscriber_base[cid] = data["price"]
-        extra = f"\n_Базовая цена: `${data['price']:.4f}`_"
-    else:
-        extra = ""
-
-    # Шаг 3 — отправляем подтверждение
-    try:
-        bot.send_message(
-            cid,
-            f"✅ *Уведомления включены!*\n\n"
-            f"Пришлю сигнал при изменении HYPE на *{threshold}%* за 10 минут.{extra}",
-        )
-        print(f"[CB] send_message OK для {cid}")
-    except Exception as e:
-        print(f"[CB] send_message FAILED: {e}")
 
 # ── Отписаться ────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "❌ Отписаться")
@@ -203,20 +168,41 @@ def cmd_help(message):
         "_Данные обновляются раз в 2 минуты (CoinGecko API)_",
     )
 
+# ── Callback ──────────────────────────────────────────────────
+@bot.callback_query_handler(func=lambda call: call.data.startswith("p"))
+def cb_threshold(call):
+    print(f"[CB] {call.data} от {call.message.chat.id}")
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        print(f"[CB] answer error: {e}")
+
+    try:
+        threshold = int(call.data[1:])
+        cid = call.message.chat.id
+        price_subscribers[cid] = threshold
+        data = get_cached()
+        if data:
+            subscriber_base[cid] = data["price"]
+            extra = f"\n_Базовая цена: `${data['price']:.4f}`_"
+        else:
+            extra = ""
+        bot.send_message(
+            cid,
+            f"✅ *Уведомления включены!*\n\n"
+            f"Пришлю сигнал при изменении HYPE на *{threshold}%* за 10 минут.{extra}",
+        )
+    except Exception as e:
+        print(f"[CB] error: {e}")
+
 # ── Fallback ──────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: True)
 def fallback(message):
-    bot.send_message(
-        message.chat.id,
-        "🤔 Не понял команду. Воспользуйся кнопками ниже.",
-        reply_markup=main_markup(),
-    )
+    bot.send_message(message.chat.id, "🤔 Воспользуйся кнопками ниже.", reply_markup=main_markup())
 
 # ── Фоновый монитор ───────────────────────────────────────────
 def price_monitor():
     global _latest, _price_history
-
-    # Первый запрос — сразу при старте
     print("[Monitor] первый запрос к CoinGecko...")
     data = _fetch_hype()
     if data:
@@ -224,8 +210,6 @@ def price_monitor():
             _latest = data
             _price_history.append((data["price"], time.time()))
         print(f"[Monitor] кэш заполнен: ${data['price']:.4f}")
-    else:
-        print("[Monitor] первый запрос не удался")
 
     while True:
         time.sleep(120)
@@ -253,8 +237,8 @@ def price_monitor():
                                 cid,
                                 f"⚡ *СИГНАЛ: HYPE {direction}*\n\n"
                                 f"Изменение за ~10 мин: `{change_pct:+.2f}%`\n"
-                                f"Цена сейчас:          `${data['price']:.4f}`\n"
-                                f"Было ~10 мин назад: `${base:.4f}`",
+                                f"Цена сейчас: `${data['price']:.4f}`\n"
+                                f"Было: `${base:.4f}`",
                             )
                             subscriber_base[cid] = data["price"]
                         except Exception:
@@ -263,11 +247,12 @@ def price_monitor():
 
 threading.Thread(target=price_monitor, daemon=True).start()
 
-# ── Запуск ────────────────────────────────────────────────────
+# ── Запуск — с allow_sending_without_reply=True ───────────────
 print("✅ Бот запущен...")
 while True:
     try:
-        bot.polling(none_stop=True, timeout=30, long_polling_timeout=20)
+        # skip_pending=True — пропускаем все накопленные апдейты
+        bot.polling(none_stop=True, timeout=30, long_polling_timeout=20, skip_pending=True)
     except Exception as e:
-        print(f"[Polling error] {e} — перезапуск через 5с")
-        time.sleep(5)
+        print(f"[Polling error] {e} — перезапуск через 10с")
+        time.sleep(10)
