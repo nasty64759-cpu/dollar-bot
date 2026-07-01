@@ -407,3 +407,4 @@ else:
         except Exception as e:
             print(f"[Polling error] {e} — перезапуск через 5с")
             time.sleep(5)
+
