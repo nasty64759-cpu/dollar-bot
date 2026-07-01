@@ -13,21 +13,26 @@ TOKEN = os.getenv("BOT_TOKEN", "8838571832:AAElqHv_qPr8EUY42vJh0EQBQDU7rAGqfRg")
 
 # ── Убиваем старые сессии через прямой HTTP запрос ──────────
 # (до создания объекта TeleBot — иначе 409 при polling)
-print("[Init] завершение старых сессий...")
-for attempt in range(5):
-    try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
-            params={"drop_pending_updates": True},
-            timeout=10
-        )
-        print(f"[Init] deleteWebhook: {r.json()}")
-        break
-    except Exception as e:
-        print(f"[Init] попытка {attempt+1} не удалась: {e}")
+def delete_webhook():
+    """Сбрасываем вебхук напрямую через HTTP — надёжнее чем через telebot"""
+    for attempt in range(5):
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
+                params={"drop_pending_updates": True},
+                timeout=10
+            )
+            result = r.json()
+            print(f"[Webhook] deleteWebhook: {result}")
+            if result.get("ok"):
+                return True
+        except Exception as e:
+            print(f"[Webhook] попытка {attempt+1} не удалась: {e}")
         time.sleep(3)
+    return False
 
-# Ждём пока Railway убьёт старый контейнер (он живёт ~10-15 сек)
+print("[Init] сброс вебхука...")
+delete_webhook()
 print("[Init] ждём завершения старого контейнера...")
 time.sleep(15)
 print("[Init] готово, стартуем")
@@ -257,8 +262,9 @@ while True:
     except Exception as e:
         err = str(e)
         if "409" in err:
-            print("[Polling] 409 конфликт — ждём 20с пока старый процесс умрёт...")
-            time.sleep(20)
+            print("[Polling] 409 — сбрасываем вебхук и ждём...")
+            delete_webhook()
+            time.sleep(10)
         else:
             print(f"[Polling error] {e} — перезапуск через 5с")
             time.sleep(5)
