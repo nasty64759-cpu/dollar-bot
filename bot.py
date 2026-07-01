@@ -56,7 +56,7 @@ def get_cached() -> dict | None:
         return dict(_latest) if _latest else None
 
 # ── Свечи (Hyperliquid → Bybit fallback) ─────────────────────
-def get_hype_candles(hours: int = 3) -> list | None:
+def get_hype_candles(hours: int = 4) -> list | None:
     """
     Пробуем источники по порядку, возвращаем список свечей:
     [{"t": ms, "o": float, "h": float, "l": float, "c": float, "v": float}, ...]
@@ -89,7 +89,7 @@ def get_hype_candles(hours: int = 3) -> list | None:
         r = requests.get(
             "https://api.bybit.com/v5/market/kline",
             params={"category": "spot", "symbol": "HYPEUSDT",
-                    "interval": "5", "limit": 36 * hours,
+                    "interval": "5", "limit": min(200, 36 * hours),
                     "start": start_ms, "end": now_ms},
             timeout=10
         )
@@ -223,7 +223,7 @@ def build_chart(candles: list, current_price: float) -> io.BytesIO:
     sign   = '+' if change >= 0 else ''
     color_title = UP if change >= 0 else DOWN
     ax.set_title(
-        f'HYPE/USDC  •  5м  •  3 часа       {sign}{change:.2f}%',
+        f'HYPE/USDC  •  5м  •  4 часа       {sign}{change:.2f}%',
         color=TEXT, fontsize=10, loc='left', pad=8,
         fontweight='bold'
     )
@@ -231,7 +231,7 @@ def build_chart(candles: list, current_price: float) -> io.BytesIO:
     # ── Метка объёма ──
     ax_vol.set_ylabel('Vol', color=TEXT, fontsize=7, rotation=0, labelpad=20)
 
-    plt.tight_layout(pad=0.5)
+    fig.subplots_adjust(left=0.05, right=0.88, top=0.93, bottom=0.08, hspace=0.04)
 
     buf = io.BytesIO()
     plt.savefig(buf, format='png', dpi=130, facecolor=BG, bbox_inches='tight')
@@ -307,7 +307,7 @@ def cmd_price(message):
         f"Мин. 24ч:   `${data['low_24h']:.4f}`"
     )
     # Пробуем прикрепить график
-    candles = get_hype_candles(3)
+    candles = get_hype_candles(4)
     if candles and len(candles) > 5:
         try:
             chart = build_chart(candles, data["price"])
@@ -381,28 +381,38 @@ def cmd_help(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("p"))
 def cb_threshold(call):
     print(f"[CB] {call.data} от {call.message.chat.id}")
+    # answer_callback_query через прямой HTTP — не зависит от polling потока
     try:
-        bot.answer_callback_query(call.id)
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": call.id},
+            timeout=5
+        )
+        print("[CB] answered OK")
     except Exception as e:
         print(f"[CB] answer error: {e}")
 
-    try:
-        threshold = int(call.data[1:])
-        cid = call.message.chat.id
-        price_subscribers[cid] = threshold
-        data = get_cached()
-        if data:
-            subscriber_base[cid] = data["price"]
-            extra = f"\n_Базовая цена: `${data['price']:.4f}`_"
-        else:
-            extra = ""
-        bot.send_message(
-            cid,
-            f"✅ *Уведомления включены!*\n\n"
-            f"Пришлю сигнал при изменении HYPE на *{threshold}%* за 10 минут.{extra}",
-        )
-    except Exception as e:
-        print(f"[CB] error: {e}")
+    def process():
+        try:
+            threshold = int(call.data[1:])
+            cid = call.message.chat.id
+            price_subscribers[cid] = threshold
+            data = get_cached()
+            if data:
+                subscriber_base[cid] = data["price"]
+                extra = f"\n_Базовая цена: `${data['price']:.4f}`_"
+            else:
+                extra = ""
+            bot.send_message(
+                cid,
+                f"✅ *Уведомления включены!*\n\n"
+                f"Пришлю сигнал при изменении HYPE на *{threshold}%* за 10 минут.{extra}",
+            )
+            print(f"[CB] send_message OK для {cid}")
+        except Exception as e:
+            print(f"[CB] process error: {e}")
+
+    threading.Thread(target=process, daemon=True).start()
 
 # ── Fallback ──────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: True)
