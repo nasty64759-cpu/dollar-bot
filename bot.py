@@ -27,10 +27,38 @@ bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 app = Flask(__name__)
 
 # ── Вебхук endpoint ──────────────────────────────────────────
+# Дедупликация - не обрабатываем один update дважды
+_processed_updates = set()
+_processed_lock = threading.Lock()
+
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
-    update = telebot.types.Update.de_json(flask_request.get_json())
-    bot.process_new_updates([update])
+    data = flask_request.get_json(silent=True)
+    if not data:
+        return "ok", 200
+
+    update_id = data.get("update_id")
+
+    # Проверяем не обрабатывали ли уже этот update
+    with _processed_lock:
+        if update_id in _processed_updates:
+            return "ok", 200  # дубликат — игнорируем
+        _processed_updates.add(update_id)
+        # Чистим старые (храним последние 100)
+        if len(_processed_updates) > 100:
+            oldest = sorted(_processed_updates)[:50]
+            for uid in oldest:
+                _processed_updates.discard(uid)
+
+    # Обрабатываем в отдельном потоке — Flask отвечает 200 МГНОВЕННО
+    def handle():
+        try:
+            update = telebot.types.Update.de_json(data)
+            bot.process_new_updates([update])
+        except Exception as e:
+            print(f"[Webhook] handle error: {e}")
+
+    threading.Thread(target=handle, daemon=True).start()
     return "ok", 200
 
 @app.route("/")
@@ -407,4 +435,3 @@ else:
         except Exception as e:
             print(f"[Polling error] {e} — перезапуск через 5с")
             time.sleep(5)
-
