@@ -7,6 +7,13 @@ import requests
 import time
 import threading
 import os
+import io
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import Rectangle
+from datetime import datetime, timezone
 from telebot import types
 
 TOKEN = os.getenv("BOT_TOKEN", "8838571832:AAElqHv_qPr8EUY42vJh0EQBQDU7rAGqfRg")
@@ -47,6 +54,143 @@ _price_history: list = []
 def get_cached() -> dict | None:
     with _cache_lock:
         return dict(_latest) if _latest else None
+
+# ── Свечи с Hyperliquid ───────────────────────────────────────
+def get_hype_candles(interval: str = "5m", hours: int = 3) -> list | None:
+    """
+    Получаем OHLCV свечи с Hyperliquid Info API.
+    interval: '5m', '15m', '1h'
+    """
+    try:
+        now_ms    = int(time.time() * 1000)
+        start_ms  = now_ms - hours * 3600 * 1000
+        url = "https://api.hyperliquid.xyz/info"
+        payload = {
+            "type": "candleSnapshot",
+            "req": {
+                "coin":       "HYPE",
+                "interval":   interval,
+                "startTime":  start_ms,
+                "endTime":    now_ms,
+            }
+        }
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
+        candles = r.json()   # [{t, o, h, l, c, v}, ...]
+        return candles
+    except Exception as e:
+        print(f"[Candles error] {e}")
+        return None
+
+def build_chart(candles: list, current_price: float) -> io.BytesIO:
+    """
+    Рисуем свечной график в стиле TradingView dark theme.
+    Возвращает BytesIO с PNG.
+    """
+    n = len(candles)
+    opens   = [float(c['o']) for c in candles]
+    highs   = [float(c['h']) for c in candles]
+    lows    = [float(c['l']) for c in candles]
+    closes  = [float(c['c']) for c in candles]
+    volumes = [float(c['v']) for c in candles]
+    times   = [datetime.fromtimestamp(c['t'] / 1000, tz=timezone.utc) for c in candles]
+
+    # ── Цвета ──
+    BG       = '#131722'
+    GRID     = '#1e2638'
+    UP       = '#26a69a'   # зелёный как TradingView
+    DOWN     = '#ef5350'   # красный
+    VOL_UP   = '#1a4a47'
+    VOL_DOWN = '#4a1a1a'
+    TEXT     = '#d1d4dc'
+    PRICE_LINE = '#f0c040'
+
+    fig, (ax, ax_vol) = plt.subplots(
+        2, 1,
+        figsize=(12, 7),
+        gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.04},
+        facecolor=BG
+    )
+
+    for ax_ in (ax, ax_vol):
+        ax_.set_facecolor(BG)
+        ax_.tick_params(colors=TEXT, labelsize=8)
+        ax_.spines[:].set_color(GRID)
+
+    # ── Свечи ──
+    width      = 0.6
+    width_wick = 0.08
+
+    for i, (o, h, l, c, v) in enumerate(zip(opens, highs, lows, closes, volumes)):
+        color = UP if c >= o else DOWN
+        vol_color = VOL_UP if c >= o else VOL_DOWN
+
+        # Тело
+        body_h = abs(c - o) if abs(c - o) > 0 else 0.001
+        ax.add_patch(Rectangle(
+            (i - width / 2, min(o, c)), width, body_h,
+            color=color, zorder=3
+        ))
+        # Фитили
+        ax.plot([i, i], [l, min(o, c)], color=color, linewidth=width_wick * 10, zorder=2)
+        ax.plot([i, i], [max(o, c), h], color=color, linewidth=width_wick * 10, zorder=2)
+
+        # Объём
+        ax_vol.add_patch(Rectangle(
+            (i - width / 2, 0), width, v,
+            color=vol_color, zorder=2
+        ))
+
+    # ── Линия текущей цены ──
+    ax.axhline(current_price, color=PRICE_LINE, linewidth=0.8, linestyle='--', zorder=4)
+    ax.text(n + 0.3, current_price, f'${current_price:.2f}',
+            color=PRICE_LINE, fontsize=8, va='center',
+            bbox=dict(boxstyle='round,pad=0.2', facecolor=PRICE_LINE, alpha=0.85))
+
+    # ── Сетка ──
+    ax.yaxis.grid(True, color=GRID, linewidth=0.5, zorder=0)
+    ax_vol.yaxis.grid(True, color=GRID, linewidth=0.5, zorder=0)
+
+    # ── Метки времени на оси X ──
+    step = max(1, n // 8)
+    x_ticks = list(range(0, n, step))
+    x_labels = [times[i].strftime('%H:%M') for i in x_ticks]
+    ax.set_xticks([])
+    ax_vol.set_xticks(x_ticks)
+    ax_vol.set_xticklabels(x_labels, color=TEXT, fontsize=7)
+
+    # ── Диапазон осей ──
+    price_pad = (max(highs) - min(lows)) * 0.05
+    ax.set_xlim(-1, n + 2)
+    ax.set_ylim(min(lows) - price_pad, max(highs) + price_pad)
+    ax_vol.set_xlim(-1, n + 2)
+    ax_vol.set_ylim(0, max(volumes) * 1.3)
+
+    ax.yaxis.set_label_position('right')
+    ax.yaxis.tick_right()
+    ax_vol.yaxis.set_label_position('right')
+    ax_vol.yaxis.tick_right()
+
+    # ── Заголовок ──
+    change = ((closes[-1] - opens[0]) / opens[0]) * 100
+    sign   = '+' if change >= 0 else ''
+    color_title = UP if change >= 0 else DOWN
+    ax.set_title(
+        f'HYPE/USDC  •  5м  •  3 часа       {sign}{change:.2f}%',
+        color=TEXT, fontsize=10, loc='left', pad=8,
+        fontweight='bold'
+    )
+
+    # ── Метка объёма ──
+    ax_vol.set_ylabel('Vol', color=TEXT, fontsize=7, rotation=0, labelpad=20)
+
+    plt.tight_layout(pad=0.5)
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=130, facecolor=BG, bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
 # ── Подписчики ───────────────────────────────────────────────
 price_subscribers: dict[int, int]   = {}
@@ -108,14 +252,24 @@ def cmd_price(message):
         return
     em   = trend_emoji(data["change_24h"])
     sign = "+" if data["change_24h"] >= 0 else ""
-    bot.send_message(
-        message.chat.id,
+    caption = (
         f"💰 *HYPE / USD*\n\n"
         f"Цена:         `${data['price']:.4f}`\n"
         f"Изм. 24ч:  {em} `{sign}{data['change_24h']:.2f}%`\n"
         f"Макс. 24ч: `${data['high_24h']:.4f}`\n"
-        f"Мин. 24ч:   `${data['low_24h']:.4f}`",
+        f"Мин. 24ч:   `${data['low_24h']:.4f}`"
     )
+    # Пробуем прикрепить график
+    candles = get_hype_candles("5m", 3)
+    if candles and len(candles) > 5:
+        try:
+            chart = build_chart(candles, data["price"])
+            bot.send_photo(message.chat.id, chart, caption=caption, parse_mode="Markdown")
+            return
+        except Exception as e:
+            print(f"[Chart error] {e}")
+    # Fallback — просто текст
+    bot.send_message(message.chat.id, caption)
 
 # ── Статистика ────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "📊 Статистика 24ч")
