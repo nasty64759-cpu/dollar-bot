@@ -1,5 +1,6 @@
 # ============================================================
-#  HYPE Monitor Bot
+#  HYPE Monitor Bot — WEBHOOK режим (Railway)
+#  Зависимости: pip install pyTelegramBotAPI requests matplotlib flask
 # ============================================================
 
 import telebot
@@ -11,40 +12,30 @@ import io
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 from matplotlib.patches import Rectangle
 from datetime import datetime, timezone
 from telebot import types
+from flask import Flask, request as flask_request
 
-TOKEN = os.getenv("BOT_TOKEN", "8838571832:AAElqHv_qPr8EUY42vJh0EQBQDU7rAGqfRg")
-
-# ── Убиваем старые сессии через прямой HTTP запрос ──────────
-# (до создания объекта TeleBot — иначе 409 при polling)
-def delete_webhook():
-    """Сбрасываем вебхук напрямую через HTTP — надёжнее чем через telebot"""
-    for attempt in range(5):
-        try:
-            r = requests.get(
-                f"https://api.telegram.org/bot{TOKEN}/deleteWebhook",
-                params={"drop_pending_updates": True},
-                timeout=10
-            )
-            result = r.json()
-            print(f"[Webhook] deleteWebhook: {result}")
-            if result.get("ok"):
-                return True
-        except Exception as e:
-            print(f"[Webhook] попытка {attempt+1} не удалась: {e}")
-        time.sleep(3)
-    return False
-
-print("[Init] сброс вебхука...")
-delete_webhook()
-print("[Init] ждём завершения старого контейнера...")
-time.sleep(15)
-print("[Init] готово, стартуем")
+TOKEN    = os.getenv("BOT_TOKEN", "8838571832:AAElqHv_qPr8EUY42vJh0EQBQDU7rAGqfRg")
+# Railway автоматически даёт переменную RAILWAY_PUBLIC_DOMAIN
+# Формат: your-app.up.railway.app
+DOMAIN   = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+PORT     = int(os.getenv("PORT", 8080))
 
 bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
+app = Flask(__name__)
+
+# ── Вебхук endpoint ──────────────────────────────────────────
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    update = telebot.types.Update.de_json(flask_request.get_json())
+    bot.process_new_updates([update])
+    return "ok", 200
+
+@app.route("/")
+def health():
+    return "HYPE Bot running", 200
 
 # ── Глобальный кэш ───────────────────────────────────────────
 _cache_lock = threading.Lock()
@@ -54,190 +45,6 @@ _price_history: list = []
 def get_cached() -> dict | None:
     with _cache_lock:
         return dict(_latest) if _latest else None
-
-# ── Свечи (Hyperliquid → Bybit fallback) ─────────────────────
-def get_hype_candles(hours: int = 4) -> list | None:
-    """
-    Пробуем источники по порядку, возвращаем список свечей:
-    [{"t": ms, "o": float, "h": float, "l": float, "c": float, "v": float}, ...]
-    """
-
-    # 1️⃣ Hyperliquid
-    try:
-        now_ms   = int(time.time() * 1000)
-        start_ms = now_ms - hours * 3600 * 1000
-        r = requests.post(
-            "https://api.hyperliquid.xyz/info",
-            json={"type": "candleSnapshot",
-                  "req": {"coin": "HYPE", "interval": "5m",
-                          "startTime": start_ms, "endTime": now_ms}},
-            timeout=10
-        )
-        raw = r.json()
-        if raw and isinstance(raw, list) and len(raw) > 5:
-            print(f"[Candles] Hyperliquid OK: {len(raw)} свечей")
-            return [{"t": c["t"], "o": float(c["o"]), "h": float(c["h"]),
-                     "l": float(c["l"]), "c": float(c["c"]), "v": float(c["v"])}
-                    for c in raw]
-    except Exception as e:
-        print(f"[Candles] Hyperliquid failed: {e}")
-
-    # 2️⃣ Bybit
-    try:
-        now_ms  = int(time.time() * 1000)
-        start_ms = now_ms - hours * 3600 * 1000
-        r = requests.get(
-            "https://api.bybit.com/v5/market/kline",
-            params={"category": "spot", "symbol": "HYPEUSDT",
-                    "interval": "5", "limit": min(200, 36 * hours),
-                    "start": start_ms, "end": now_ms},
-            timeout=10
-        )
-        data = r.json()
-        raw = data.get("result", {}).get("list", [])
-        if raw and len(raw) > 5:
-            # Bybit: [startTime, open, high, low, close, volume, ...]
-            # Отсортируем по времени (Bybit даёт в обратном порядке)
-            raw = sorted(raw, key=lambda x: int(x[0]))
-            candles = [{"t": int(c[0]), "o": float(c[1]), "h": float(c[2]),
-                        "l": float(c[3]), "c": float(c[4]), "v": float(c[5])}
-                       for c in raw]
-            print(f"[Candles] Bybit OK: {len(candles)} свечей")
-            return candles
-    except Exception as e:
-        print(f"[Candles] Bybit failed: {e}")
-
-    # 3️⃣ Gate.io
-    try:
-        r = requests.get(
-            "https://api.gateio.ws/api/v4/spot/candlesticks",
-            params={"currency_pair": "HYPE_USDT", "interval": "5m",
-                    "limit": 36 * hours},
-            timeout=10
-        )
-        raw = r.json()
-        if raw and len(raw) > 5:
-            # Gate: [timestamp_s, volume, close, high, low, open, ...]
-            candles = [{"t": int(c[0]) * 1000, "o": float(c[5]), "h": float(c[3]),
-                        "l": float(c[4]), "c": float(c[2]), "v": float(c[1])}
-                       for c in sorted(raw, key=lambda x: int(x[0]))]
-            print(f"[Candles] Gate.io OK: {len(candles)} свечей")
-            return candles
-    except Exception as e:
-        print(f"[Candles] Gate.io failed: {e}")
-
-    print("[Candles] все источники недоступны")
-    return None
-
-def build_chart(candles: list, current_price: float) -> io.BytesIO:
-    """
-    Рисуем свечной график в стиле TradingView dark theme.
-    Возвращает BytesIO с PNG.
-    """
-    n = len(candles)
-    opens   = [float(c['o']) for c in candles]
-    highs   = [float(c['h']) for c in candles]
-    lows    = [float(c['l']) for c in candles]
-    closes  = [float(c['c']) for c in candles]
-    volumes = [float(c['v']) for c in candles]
-    times   = [datetime.fromtimestamp(c['t'] / 1000, tz=timezone.utc) for c in candles]
-
-    # ── Цвета ──
-    BG       = '#131722'
-    GRID     = '#1e2638'
-    UP       = '#26a69a'   # зелёный как TradingView
-    DOWN     = '#ef5350'   # красный
-    VOL_UP   = '#1a4a47'
-    VOL_DOWN = '#4a1a1a'
-    TEXT     = '#d1d4dc'
-    PRICE_LINE = '#f0c040'
-
-    fig, (ax, ax_vol) = plt.subplots(
-        2, 1,
-        figsize=(12, 7),
-        gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.04},
-        facecolor=BG
-    )
-
-    for ax_ in (ax, ax_vol):
-        ax_.set_facecolor(BG)
-        ax_.tick_params(colors=TEXT, labelsize=8)
-        ax_.spines[:].set_color(GRID)
-
-    # ── Свечи ──
-    width      = 0.6
-    width_wick = 0.08
-
-    for i, (o, h, l, c, v) in enumerate(zip(opens, highs, lows, closes, volumes)):
-        color = UP if c >= o else DOWN
-        vol_color = VOL_UP if c >= o else VOL_DOWN
-
-        # Тело
-        body_h = abs(c - o) if abs(c - o) > 0 else 0.001
-        ax.add_patch(Rectangle(
-            (i - width / 2, min(o, c)), width, body_h,
-            color=color, zorder=3
-        ))
-        # Фитили
-        ax.plot([i, i], [l, min(o, c)], color=color, linewidth=width_wick * 10, zorder=2)
-        ax.plot([i, i], [max(o, c), h], color=color, linewidth=width_wick * 10, zorder=2)
-
-        # Объём
-        ax_vol.add_patch(Rectangle(
-            (i - width / 2, 0), width, v,
-            color=vol_color, zorder=2
-        ))
-
-    # ── Линия текущей цены ──
-    ax.axhline(current_price, color=PRICE_LINE, linewidth=0.8, linestyle='--', zorder=4)
-    ax.text(n + 0.3, current_price, f'${current_price:.2f}',
-            color=PRICE_LINE, fontsize=8, va='center',
-            bbox=dict(boxstyle='round,pad=0.2', facecolor=PRICE_LINE, alpha=0.85))
-
-    # ── Сетка ──
-    ax.yaxis.grid(True, color=GRID, linewidth=0.5, zorder=0)
-    ax_vol.yaxis.grid(True, color=GRID, linewidth=0.5, zorder=0)
-
-    # ── Метки времени на оси X ──
-    step = max(1, n // 8)
-    x_ticks = list(range(0, n, step))
-    x_labels = [times[i].strftime('%H:%M') for i in x_ticks]
-    ax.set_xticks([])
-    ax_vol.set_xticks(x_ticks)
-    ax_vol.set_xticklabels(x_labels, color=TEXT, fontsize=7)
-
-    # ── Диапазон осей ──
-    price_pad = (max(highs) - min(lows)) * 0.05
-    ax.set_xlim(-1, n + 2)
-    ax.set_ylim(min(lows) - price_pad, max(highs) + price_pad)
-    ax_vol.set_xlim(-1, n + 2)
-    ax_vol.set_ylim(0, max(volumes) * 1.3)
-
-    ax.yaxis.set_label_position('right')
-    ax.yaxis.tick_right()
-    ax_vol.yaxis.set_label_position('right')
-    ax_vol.yaxis.tick_right()
-
-    # ── Заголовок ──
-    change = ((closes[-1] - opens[0]) / opens[0]) * 100
-    sign   = '+' if change >= 0 else ''
-    color_title = UP if change >= 0 else DOWN
-    ax.set_title(
-        f'HYPE/USDC  •  5м  •  4 часа       {sign}{change:.2f}%',
-        color=TEXT, fontsize=10, loc='left', pad=8,
-        fontweight='bold'
-    )
-
-    # ── Метка объёма ──
-    ax_vol.set_ylabel('Vol', color=TEXT, fontsize=7, rotation=0, labelpad=20)
-
-    fig.subplots_adjust(left=0.05, right=0.88, top=0.93, bottom=0.08, hspace=0.04)
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=130, facecolor=BG, bbox_inches='tight')
-    plt.close(fig)
-    buf.seek(0)
-    return buf
 
 # ── Подписчики ───────────────────────────────────────────────
 price_subscribers: dict[int, int]   = {}
@@ -279,14 +86,144 @@ def trend_emoji(change: float) -> str:
     if change >= -3: return "📉"
     return "🔻"
 
+# ── Свечи (Hyperliquid → Bybit → Gate.io) ───────────────────
+def get_hype_candles(hours: int = 4) -> list | None:
+    now_ms   = int(time.time() * 1000)
+    start_ms = now_ms - hours * 3600 * 1000
+
+    # 1️⃣ Hyperliquid
+    try:
+        r = requests.post(
+            "https://api.hyperliquid.xyz/info",
+            json={"type": "candleSnapshot",
+                  "req": {"coin": "HYPE", "interval": "5m",
+                          "startTime": start_ms, "endTime": now_ms}},
+            timeout=10
+        )
+        raw = r.json()
+        if raw and isinstance(raw, list) and len(raw) > 5:
+            print(f"[Candles] Hyperliquid OK: {len(raw)} свечей")
+            return [{"t": c["t"], "o": float(c["o"]), "h": float(c["h"]),
+                     "l": float(c["l"]), "c": float(c["c"]), "v": float(c["v"])}
+                    for c in raw]
+    except Exception as e:
+        print(f"[Candles] Hyperliquid failed: {e}")
+
+    # 2️⃣ Bybit
+    try:
+        r = requests.get(
+            "https://api.bybit.com/v5/market/kline",
+            params={"category": "spot", "symbol": "HYPEUSDT", "interval": "5",
+                    "limit": min(200, 12 * hours), "start": start_ms, "end": now_ms},
+            timeout=10
+        )
+        raw = r.json().get("result", {}).get("list", [])
+        if raw and len(raw) > 5:
+            candles = [{"t": int(c[0]), "o": float(c[1]), "h": float(c[2]),
+                        "l": float(c[3]), "c": float(c[4]), "v": float(c[5])}
+                       for c in sorted(raw, key=lambda x: int(x[0]))]
+            print(f"[Candles] Bybit OK: {len(candles)} свечей")
+            return candles
+    except Exception as e:
+        print(f"[Candles] Bybit failed: {e}")
+
+    # 3️⃣ Gate.io
+    try:
+        r = requests.get(
+            "https://api.gateio.ws/api/v4/spot/candlesticks",
+            params={"currency_pair": "HYPE_USDT", "interval": "5m",
+                    "limit": min(200, 12 * hours)},
+            timeout=10
+        )
+        raw = r.json()
+        if raw and len(raw) > 5:
+            candles = [{"t": int(c[0]) * 1000, "o": float(c[5]), "h": float(c[3]),
+                        "l": float(c[4]), "c": float(c[2]), "v": float(c[1])}
+                       for c in sorted(raw, key=lambda x: int(x[0]))]
+            print(f"[Candles] Gate.io OK: {len(candles)} свечей")
+            return candles
+    except Exception as e:
+        print(f"[Candles] Gate.io failed: {e}")
+
+    return None
+
+# ── График ────────────────────────────────────────────────────
+def build_chart(candles: list, current_price: float) -> io.BytesIO:
+    opens   = [c['o'] for c in candles]
+    highs   = [c['h'] for c in candles]
+    lows    = [c['l'] for c in candles]
+    closes  = [c['c'] for c in candles]
+    volumes = [c['v'] for c in candles]
+    times   = [datetime.fromtimestamp(c['t'] / 1000, tz=timezone.utc) for c in candles]
+    n = len(candles)
+
+    BG, GRID = '#131722', '#1e2638'
+    UP, DOWN = '#26a69a', '#ef5350'
+    TEXT, PRICE_LINE = '#d1d4dc', '#f0c040'
+
+    fig = plt.figure(figsize=(12, 7), facecolor=BG)
+    ax     = fig.add_axes([0.02, 0.18, 0.84, 0.72], facecolor=BG)
+    ax_vol = fig.add_axes([0.02, 0.05, 0.84, 0.11], facecolor=BG)
+
+    for ax_ in (ax, ax_vol):
+        ax_.tick_params(colors=TEXT, labelsize=8)
+        for spine in ax_.spines.values():
+            spine.set_color(GRID)
+
+    width = 0.6
+    for i, (o, h, l, c, v) in enumerate(zip(opens, highs, lows, closes, volumes)):
+        color = UP if c >= o else DOWN
+        body_h = max(abs(c - o), 0.001)
+        ax.add_patch(Rectangle((i - width/2, min(o,c)), width, body_h, color=color, zorder=3))
+        ax.plot([i, i], [l, min(o,c)], color=color, linewidth=1, zorder=2)
+        ax.plot([i, i], [max(o,c), h], color=color, linewidth=1, zorder=2)
+        ax_vol.add_patch(Rectangle(
+            (i - width/2, 0), width, v,
+            color='#1a4a47' if c >= o else '#4a1a1a', zorder=2
+        ))
+
+    ax.axhline(current_price, color=PRICE_LINE, linewidth=0.9, linestyle='--', zorder=4)
+    ax.text(n + 0.5, current_price, f'${current_price:.2f}',
+            color='#131722', fontsize=8, va='center', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.3', facecolor=PRICE_LINE, edgecolor='none'))
+
+    ax.yaxis.grid(True, color=GRID, linewidth=0.5, zorder=0)
+    ax_vol.yaxis.grid(True, color=GRID, linewidth=0.5, zorder=0)
+
+    step = max(1, n // 8)
+    x_ticks = list(range(0, n, step))
+    ax.set_xticks([])
+    ax_vol.set_xticks(x_ticks)
+    ax_vol.set_xticklabels([times[i].strftime('%H:%M') for i in x_ticks], color=TEXT, fontsize=7)
+
+    price_pad = (max(highs) - min(lows)) * 0.05
+    ax.set_xlim(-1, n + 3)
+    ax.set_ylim(min(lows) - price_pad, max(highs) + price_pad)
+    ax_vol.set_xlim(-1, n + 3)
+    ax_vol.set_ylim(0, max(volumes) * 1.3)
+
+    ax.yaxis.set_label_position('right')
+    ax.yaxis.tick_right()
+    ax_vol.yaxis.set_label_position('right')
+    ax_vol.yaxis.tick_right()
+
+    change = (closes[-1] - opens[0]) / opens[0] * 100
+    sign   = '+' if change >= 0 else ''
+    ax.set_title(f'HYPE/USDC  •  5м  •  4 часа       {sign}{change:.2f}%',
+                 color=TEXT, fontsize=10, loc='left', pad=8, fontweight='bold')
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=130, facecolor=BG)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
 # ── /start ────────────────────────────────────────────────────
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     bot.send_message(
         message.chat.id,
-        "👋 *HYPE Monitor Bot*\n\n"
-        "Слежу за ценой монеты *Hyperliquid (HYPE)* в реальном времени.\n\n"
-        "Выбери действие на клавиатуре ниже 👇",
+        "👋 *HYPE Monitor Bot*\n\nСлежу за ценой *Hyperliquid (HYPE)* в реальном времени.\n\nВыбери действие 👇",
         reply_markup=main_markup(),
     )
 
@@ -306,7 +243,6 @@ def cmd_price(message):
         f"Макс. 24ч: `${data['high_24h']:.4f}`\n"
         f"Мин. 24ч:   `${data['low_24h']:.4f}`"
     )
-    # Пробуем прикрепить график
     candles = get_hype_candles(4)
     if candles and len(candles) > 5:
         try:
@@ -315,7 +251,6 @@ def cmd_price(message):
             return
         except Exception as e:
             print(f"[Chart error] {e}")
-    # Fallback — просто текст
     bot.send_message(message.chat.id, caption)
 
 # ── Статистика ────────────────────────────────────────────────
@@ -342,16 +277,41 @@ def cmd_notify(message):
     current = price_subscribers.get(message.chat.id)
     note    = f"\n\n_Сейчас активно: {current}%_" if current else ""
     markup  = types.InlineKeyboardMarkup()
-    markup.row(types.InlineKeyboardButton("⚡ 1%",  callback_data="p1"))
-    markup.row(types.InlineKeyboardButton("🔥 2%",  callback_data="p2"))
-    markup.row(types.InlineKeyboardButton("🚨 5%",  callback_data="p5"))
-    markup.row(types.InlineKeyboardButton("💥 10%", callback_data="p10"))
+    markup.row(types.InlineKeyboardButton("⚡ 1% за 10 мин",  callback_data="p1"))
+    markup.row(types.InlineKeyboardButton("🔥 3% за 10 мин",  callback_data="p3"))
+    markup.row(types.InlineKeyboardButton("🚨 5% за 10 мин",  callback_data="p5"))
+    markup.row(types.InlineKeyboardButton("💥 10% за 10 мин", callback_data="p10"))
     bot.send_message(
         message.chat.id,
-        f"🔔 *Уведомления о резком движении цены*\n\n"
-        f"Выбери порог изменения за ~10 минут:{note}",
+        f"🔔 *Уведомления о движении цены*\n\n"
+        f"Бот смотрит последние 10 свечей по 1 минуте.\n"
+        f"Если цена изменится на выбранный % — пришлю сигнал.{note}",
         reply_markup=markup,
     )
+
+# ── Callback ──────────────────────────────────────────────────
+@bot.callback_query_handler(func=lambda call: call.data.startswith("p"))
+def cb_threshold(call):
+    print(f"[CB] получен: {call.data} от {call.message.chat.id}")
+    bot.answer_callback_query(call.id)
+    try:
+        threshold = int(call.data[1:])
+        cid = call.message.chat.id
+        price_subscribers[cid] = threshold
+        data = get_cached()
+        if data:
+            subscriber_base[cid] = data["price"]
+            extra = f"\n_Базовая цена: `${data['price']:.4f}`_"
+        else:
+            extra = ""
+        bot.send_message(
+            cid,
+            f"✅ *Уведомления включены!*\n\n"
+            f"Порог: *{threshold}%* за 10 минут (10 свечей по 1м).{extra}",
+        )
+        print(f"[CB] OK для {cid}, порог {threshold}%")
+    except Exception as e:
+        print(f"[CB] error: {e}")
 
 # ── Отписаться ────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "❌ Отписаться")
@@ -370,56 +330,19 @@ def cmd_help(message):
     bot.send_message(
         message.chat.id,
         "📖 *Как пользоваться ботом*\n\n"
-        "💰 *Курс HYPE* — текущая цена + диапазон дня\n"
-        "📊 *Статистика 24ч* — объём, капитализация, изменения\n"
-        "🔔 *Уведомления* — оповещение при резком скачке цены\n"
+        "💰 *Курс HYPE* — цена + график 5м за 4 часа\n"
+        "📊 *Статистика 24ч* — объём, капитализация\n"
+        "🔔 *Уведомления* — сигнал при резком движении\n"
         "❌ *Отписаться* — выключить уведомления\n\n"
-        "_Данные обновляются раз в 2 минуты (CoinGecko API)_",
+        "_Данные обновляются раз в 2 минуты_",
     )
-
-# ── Callback ──────────────────────────────────────────────────
-@bot.callback_query_handler(func=lambda call: call.data.startswith("p"))
-def cb_threshold(call):
-    print(f"[CB] {call.data} от {call.message.chat.id}")
-    # answer_callback_query через прямой HTTP — не зависит от polling потока
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery",
-            json={"callback_query_id": call.id},
-            timeout=5
-        )
-        print("[CB] answered OK")
-    except Exception as e:
-        print(f"[CB] answer error: {e}")
-
-    def process():
-        try:
-            threshold = int(call.data[1:])
-            cid = call.message.chat.id
-            price_subscribers[cid] = threshold
-            data = get_cached()
-            if data:
-                subscriber_base[cid] = data["price"]
-                extra = f"\n_Базовая цена: `${data['price']:.4f}`_"
-            else:
-                extra = ""
-            bot.send_message(
-                cid,
-                f"✅ *Уведомления включены!*\n\n"
-                f"Пришлю сигнал при изменении HYPE на *{threshold}%* за 10 минут.{extra}",
-            )
-            print(f"[CB] send_message OK для {cid}")
-        except Exception as e:
-            print(f"[CB] process error: {e}")
-
-    threading.Thread(target=process, daemon=True).start()
 
 # ── Fallback ──────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: True)
 def fallback(message):
     bot.send_message(message.chat.id, "🤔 Воспользуйся кнопками ниже.", reply_markup=main_markup())
 
-# ── Фоновый монитор ───────────────────────────────────────────
+# ── Монитор цены — 1м свечи за последние 10 минут ────────────
 def price_monitor():
     global _latest, _price_history
     print("[Monitor] первый запрос к CoinGecko...")
@@ -427,26 +350,25 @@ def price_monitor():
     if data:
         with _cache_lock:
             _latest = data
-            _price_history.append((data["price"], time.time()))
         print(f"[Monitor] кэш заполнен: ${data['price']:.4f}")
 
     while True:
-        time.sleep(120)
+        time.sleep(60)  # проверяем каждую минуту
         data = _fetch_hype()
         now  = time.time()
         if data:
             with _cache_lock:
                 _latest = data
                 _price_history.append((data["price"], now))
+                # храним только последние 15 минут
                 _price_history = [(p, t) for p, t in _price_history if now - t <= 900]
                 history_snap = list(_price_history)
 
+            # Проверяем подписчиков — смотрим 10 свечей назад (~10 минут)
             for cid, threshold in list(price_subscribers.items()):
-                base = subscriber_base.get(cid, 0)
-                if base == 0:
-                    candidates = [p for p, t in history_snap if 540 <= now - t <= 780]
-                    if candidates:
-                        base = candidates[0]
+                ten_min_ago = [p for p, t in history_snap if 540 <= now - t <= 660]
+                base = ten_min_ago[0] if ten_min_ago else subscriber_base.get(cid, 0)
+
                 if base > 0:
                     change_pct = (data["price"] - base) / base * 100
                     if abs(change_pct) >= threshold:
@@ -455,9 +377,9 @@ def price_monitor():
                             bot.send_message(
                                 cid,
                                 f"⚡ *СИГНАЛ: HYPE {direction}*\n\n"
-                                f"Изменение за ~10 мин: `{change_pct:+.2f}%`\n"
+                                f"Изменение за 10 мин: `{change_pct:+.2f}%`\n"
                                 f"Цена сейчас: `${data['price']:.4f}`\n"
-                                f"Было: `${base:.4f}`",
+                                f"Было 10 мин назад: `${base:.4f}`",
                             )
                             subscriber_base[cid] = data["price"]
                         except Exception:
@@ -466,16 +388,22 @@ def price_monitor():
 
 threading.Thread(target=price_monitor, daemon=True).start()
 
+# ── Запуск: webhook если есть DOMAIN, иначе polling ──────────
 print("✅ Бот запущен...")
-while True:
-    try:
-        bot.polling(none_stop=True, timeout=30, long_polling_timeout=20, skip_pending=True)
-    except Exception as e:
-        err = str(e)
-        if "409" in err:
-            print("[Polling] 409 — сбрасываем вебхук и ждём...")
-            delete_webhook()
-            time.sleep(10)
-        else:
+if DOMAIN:
+    webhook_url = f"https://{DOMAIN}/{TOKEN}"
+    bot.remove_webhook()
+    time.sleep(1)
+    bot.set_webhook(url=webhook_url)
+    print(f"[Webhook] установлен: {webhook_url}")
+    app.run(host="0.0.0.0", port=PORT)
+else:
+    # Локальный запуск — polling
+    print("[Polling] DOMAIN не задан, используем polling")
+    bot.remove_webhook()
+    while True:
+        try:
+            bot.polling(none_stop=True, timeout=30, long_polling_timeout=20, skip_pending=True)
+        except Exception as e:
             print(f"[Polling error] {e} — перезапуск через 5с")
             time.sleep(5)
