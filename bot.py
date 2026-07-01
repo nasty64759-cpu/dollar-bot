@@ -318,10 +318,18 @@ def cmd_notify(message):
     )
 
 # ── Callback ──────────────────────────────────────────────────
-@bot.callback_query_handler(func=lambda call: call.data.startswith("p"))
+@bot.callback_query_handler(func=lambda call: True)
 def cb_threshold(call):
-    print(f"[CB] получен: {call.data} от {call.message.chat.id}")
-    bot.answer_callback_query(call.id)
+    print(f"[CB] получен: data='{call.data}' id={call.id} chat={call.message.chat.id}")
+    try:
+        bot.answer_callback_query(call.id, text="✅")
+        print(f"[CB] answer_callback_query OK")
+    except Exception as e:
+        print(f"[CB] answer_callback_query FAILED: {e}")
+
+    if not call.data.startswith("p"):
+        return
+
     try:
         threshold = int(call.data[1:])
         cid = call.message.chat.id
@@ -335,11 +343,15 @@ def cb_threshold(call):
         bot.send_message(
             cid,
             f"✅ *Уведомления включены!*\n\n"
-            f"Порог: *{threshold}%* за 10 минут (10 свечей по 1м).{extra}",
+            f"Порог: *{threshold}%* за 10 минут.{extra}",
         )
-        print(f"[CB] OK для {cid}, порог {threshold}%")
+        print(f"[CB] send_message OK для {cid}, порог {threshold}%")
     except Exception as e:
-        print(f"[CB] error: {e}")
+        print(f"[CB] FAILED: {e}")
+        try:
+            bot.send_message(call.message.chat.id, f"❌ Ошибка: {e}")
+        except:
+            pass
 
 # ── Отписаться ────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text == "❌ Отписаться")
