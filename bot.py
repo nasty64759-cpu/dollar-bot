@@ -55,32 +55,79 @@ def get_cached() -> dict | None:
     with _cache_lock:
         return dict(_latest) if _latest else None
 
-# ── Свечи с Hyperliquid ───────────────────────────────────────
-def get_hype_candles(interval: str = "5m", hours: int = 3) -> list | None:
+# ── Свечи (Hyperliquid → Bybit fallback) ─────────────────────
+def get_hype_candles(hours: int = 3) -> list | None:
     """
-    Получаем OHLCV свечи с Hyperliquid Info API.
-    interval: '5m', '15m', '1h'
+    Пробуем источники по порядку, возвращаем список свечей:
+    [{"t": ms, "o": float, "h": float, "l": float, "c": float, "v": float}, ...]
     """
+
+    # 1️⃣ Hyperliquid
     try:
-        now_ms    = int(time.time() * 1000)
-        start_ms  = now_ms - hours * 3600 * 1000
-        url = "https://api.hyperliquid.xyz/info"
-        payload = {
-            "type": "candleSnapshot",
-            "req": {
-                "coin":       "HYPE",
-                "interval":   interval,
-                "startTime":  start_ms,
-                "endTime":    now_ms,
-            }
-        }
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        candles = r.json()   # [{t, o, h, l, c, v}, ...]
-        return candles
+        now_ms   = int(time.time() * 1000)
+        start_ms = now_ms - hours * 3600 * 1000
+        r = requests.post(
+            "https://api.hyperliquid.xyz/info",
+            json={"type": "candleSnapshot",
+                  "req": {"coin": "HYPE", "interval": "5m",
+                          "startTime": start_ms, "endTime": now_ms}},
+            timeout=10
+        )
+        raw = r.json()
+        if raw and isinstance(raw, list) and len(raw) > 5:
+            print(f"[Candles] Hyperliquid OK: {len(raw)} свечей")
+            return [{"t": c["t"], "o": float(c["o"]), "h": float(c["h"]),
+                     "l": float(c["l"]), "c": float(c["c"]), "v": float(c["v"])}
+                    for c in raw]
     except Exception as e:
-        print(f"[Candles error] {e}")
-        return None
+        print(f"[Candles] Hyperliquid failed: {e}")
+
+    # 2️⃣ Bybit
+    try:
+        now_ms  = int(time.time() * 1000)
+        start_ms = now_ms - hours * 3600 * 1000
+        r = requests.get(
+            "https://api.bybit.com/v5/market/kline",
+            params={"category": "spot", "symbol": "HYPEUSDT",
+                    "interval": "5", "limit": 36 * hours,
+                    "start": start_ms, "end": now_ms},
+            timeout=10
+        )
+        data = r.json()
+        raw = data.get("result", {}).get("list", [])
+        if raw and len(raw) > 5:
+            # Bybit: [startTime, open, high, low, close, volume, ...]
+            # Отсортируем по времени (Bybit даёт в обратном порядке)
+            raw = sorted(raw, key=lambda x: int(x[0]))
+            candles = [{"t": int(c[0]), "o": float(c[1]), "h": float(c[2]),
+                        "l": float(c[3]), "c": float(c[4]), "v": float(c[5])}
+                       for c in raw]
+            print(f"[Candles] Bybit OK: {len(candles)} свечей")
+            return candles
+    except Exception as e:
+        print(f"[Candles] Bybit failed: {e}")
+
+    # 3️⃣ Gate.io
+    try:
+        r = requests.get(
+            "https://api.gateio.ws/api/v4/spot/candlesticks",
+            params={"currency_pair": "HYPE_USDT", "interval": "5m",
+                    "limit": 36 * hours},
+            timeout=10
+        )
+        raw = r.json()
+        if raw and len(raw) > 5:
+            # Gate: [timestamp_s, volume, close, high, low, open, ...]
+            candles = [{"t": int(c[0]) * 1000, "o": float(c[5]), "h": float(c[3]),
+                        "l": float(c[4]), "c": float(c[2]), "v": float(c[1])}
+                       for c in sorted(raw, key=lambda x: int(x[0]))]
+            print(f"[Candles] Gate.io OK: {len(candles)} свечей")
+            return candles
+    except Exception as e:
+        print(f"[Candles] Gate.io failed: {e}")
+
+    print("[Candles] все источники недоступны")
+    return None
 
 def build_chart(candles: list, current_price: float) -> io.BytesIO:
     """
@@ -260,7 +307,7 @@ def cmd_price(message):
         f"Мин. 24ч:   `${data['low_24h']:.4f}`"
     )
     # Пробуем прикрепить график
-    candles = get_hype_candles("5m", 3)
+    candles = get_hype_candles(3)
     if candles and len(candles) > 5:
         try:
             chart = build_chart(candles, data["price"])
