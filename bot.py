@@ -8,6 +8,7 @@ import time
 import threading
 import os
 import io
+import json
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -46,13 +47,11 @@ def webhook():
     uid = data.get("update_id", 0)
     if is_duplicate(uid):
         return "ok", 200
-    # Логируем сырой тип апдейта
+    
     keys = [k for k in data.keys() if k != "update_id"]
     print(f"[WH] update_id={uid} type={keys}")
-    threading.Thread(
-        target=lambda: _handle(data),
-        daemon=True
-    ).start()
+    
+    threading.Thread(target=lambda: _handle(data), daemon=True).start()
     return "ok", 200
 
 def _handle(data):
@@ -75,9 +74,31 @@ def get_cached():
     with _cache_lock:
         return dict(_latest) if _latest else None
 
-# ── Подписчики — просто set chat_id ──────────────────────────
+# ── Подписчики с сохранением ─────────────────────────────────
+SUBS_FILE = "subscribers.json"
 subscribers: set = set()
 sub_base: dict[int, float] = {}  # chat_id -> цена при подписке
+
+def load_subscribers():
+    global subscribers, sub_base
+    try:
+        with open(SUBS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            subscribers.update(data.get("subscribers", []))
+            sub_base.update({int(k): v for k, v in data.get("sub_base", {}).items()})
+        print(f"[Subs] Загружено {len(subscribers)} подписчиков")
+    except Exception:
+        pass
+
+def save_subscribers():
+    try:
+        with open(SUBS_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "subscribers": list(subscribers),
+                "sub_base": sub_base
+            }, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[Subs] Ошибка сохранения: {e}")
 
 # ── Меню ─────────────────────────────────────────────────────
 def main_markup():
@@ -119,9 +140,9 @@ def get_candles(hours=4):
     try:
         r = requests.post("https://api.hyperliquid.xyz/info",
             json={"type":"candleSnapshot","req":{"coin":"HYPE","interval":"5m",
-                  "startTime":start_ms,"endTime":now_ms}}, timeout=10)
+                  "startTime":start_ms,"endTime":now_ms}}, timeout=12)
         raw = r.json()
-        if raw and len(raw)>5:
+        if isinstance(raw, list) and len(raw) > 5:
             print(f"[Candles] OK: {len(raw)}")
             return [{"t":c["t"],"o":float(c["o"]),"h":float(c["h"]),
                      "l":float(c["l"]),"c":float(c["c"]),"v":float(c["v"])} for c in raw]
@@ -129,46 +150,67 @@ def get_candles(hours=4):
         print(f"[Candles] error: {e}")
     return None
 
-# ── График ────────────────────────────────────────────────────
+# ── График (увеличен шрифт цены) ─────────────────────────────
 def build_chart(candles, price):
     o=[c['o'] for c in candles]; h=[c['h'] for c in candles]
     l=[c['l'] for c in candles]; cl=[c['c'] for c in candles]
     v=[c['v'] for c in candles]
-    t=[datetime.fromtimestamp(c['t']/1000,tz=timezone.utc) for c in candles]
-    n=len(candles)
-    BG,GRID,UP,DOWN,TEXT,PL='#131722','#1e2638','#26a69a','#ef5350','#d1d4dc','#f0c040'
-    fig=plt.figure(figsize=(12,7),facecolor=BG)
-    ax=fig.add_axes([0.02,0.18,0.84,0.72],facecolor=BG)
-    av=fig.add_axes([0.02,0.05,0.84,0.11],facecolor=BG)
-    for a in (ax,av):
-        a.tick_params(colors=TEXT,labelsize=8)
-        for s in a.spines.values(): s.set_color(GRID)
-    for i,(oi,hi,li,ci,vi) in enumerate(zip(o,h,l,cl,v)):
-        col=UP if ci>=oi else DOWN
-        ax.add_patch(Rectangle((i-.3,min(oi,ci)),.6,max(abs(ci-oi),.001),color=col,zorder=3))
-        ax.plot([i,i],[li,min(oi,ci)],color=col,linewidth=1,zorder=2)
-        ax.plot([i,i],[max(oi,ci),hi],color=col,linewidth=1,zorder=2)
-        av.add_patch(Rectangle((i-.3,0),.6,vi,color='#1a4a47' if ci>=oi else '#4a1a1a',zorder=2))
-    ax.axhline(price,color=PL,linewidth=.9,linestyle='--',zorder=4)
-    ax.text(n+.5,price,f'${price:.2f}',color='#131722',fontsize=8,va='center',fontweight='bold',
-            bbox=dict(boxstyle='round,pad=0.3',facecolor=PL,edgecolor='none'))
-    ax.yaxis.grid(True,color=GRID,linewidth=.5,zorder=0)
-    av.yaxis.grid(True,color=GRID,linewidth=.5,zorder=0)
-    step=max(1,n//8)
-    xt=list(range(0,n,step))
-    ax.set_xticks([]); av.set_xticks(xt)
-    av.set_xticklabels([t[i].strftime('%H:%M') for i in xt],color=TEXT,fontsize=7)
-    pp=(max(h)-min(l))*.05
-    ax.set_xlim(-1,n+3); ax.set_ylim(min(l)-pp,max(h)+pp)
-    av.set_xlim(-1,n+3); av.set_ylim(0,max(v)*1.3)
-    ax.yaxis.set_label_position('right'); ax.yaxis.tick_right()
-    av.yaxis.set_label_position('right'); av.yaxis.tick_right()
-    chg=(cl[-1]-o[0])/o[0]*100
+    t=[datetime.fromtimestamp(c['t']/1000, tz=timezone.utc) for c in candles]
+    n = len(candles)
+    
+    BG,GRID,UP,DOWN,TEXT,PL = '#131722','#1e2638','#26a69a','#ef5350','#d1d4dc','#f0c040'
+    
+    fig = plt.figure(figsize=(12,7), facecolor=BG)
+    ax = fig.add_axes([0.02, 0.18, 0.84, 0.72], facecolor=BG)
+    av = fig.add_axes([0.02, 0.05, 0.84, 0.11], facecolor=BG)
+
+    for a in (ax, av):
+        a.tick_params(colors=TEXT, labelsize=8)
+        for s in a.spines.values():
+            s.set_color(GRID)
+
+    for i, (oi, hi, li, ci, vi) in enumerate(zip(o, h, l, cl, v)):
+        col = UP if ci >= oi else DOWN
+        ax.add_patch(Rectangle((i-.3, min(oi, ci)), .6, max(abs(ci-oi), .001), color=col, zorder=3))
+        ax.plot([i, i], [li, min(oi, ci)], color=col, linewidth=1, zorder=2)
+        ax.plot([i, i], [max(oi, ci), hi], color=col, linewidth=1, zorder=2)
+        av.add_patch(Rectangle((i-.3, 0), .6, vi, 
+                             color='#1a4a47' if ci >= oi else '#4a1a1a', zorder=2))
+
+    # Увеличенный шрифт цены
+    ax.axhline(price, color=PL, linewidth=1, linestyle='--', zorder=4)
+    ax.text(n + 0.8, price, f'${price:.4f}', color='#131722', fontsize=11,  # ← увеличен
+            va='center', fontweight='bold',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor=PL, edgecolor='none'))
+
+    ax.yaxis.grid(True, color=GRID, linewidth=0.5, zorder=0)
+    av.yaxis.grid(True, color=GRID, linewidth=0.5, zorder=0)
+
+    step = max(1, n//8)
+    xt = list(range(0, n, step))
+    ax.set_xticks([])
+    av.set_xticks(xt)
+    av.set_xticklabels([t[i].strftime('%H:%M') for i in xt], color=TEXT, fontsize=7)
+
+    pp = (max(h) - min(l)) * 0.05
+    ax.set_xlim(-1, n + 3)
+    ax.set_ylim(min(l) - pp, max(h) + pp)
+    av.set_xlim(-1, n + 3)
+    av.set_ylim(0, max(v) * 1.3)
+
+    ax.yaxis.set_label_position('right')
+    ax.yaxis.tick_right()
+    av.yaxis.set_label_position('right')
+    av.yaxis.tick_right()
+
+    chg = (cl[-1] - o[0]) / o[0] * 100
     ax.set_title(f"HYPE/USDC  •  5м  •  4ч       {'+' if chg>=0 else ''}{chg:.2f}%",
-                 color=TEXT,fontsize=10,loc='left',pad=8,fontweight='bold')
-    buf=io.BytesIO()
-    fig.savefig(buf,format='png',dpi=130,facecolor=BG)
-    plt.close(fig); buf.seek(0)
+                 color=TEXT, fontsize=11, loc='left', pad=8, fontweight='bold')
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=130, facecolor=BG)
+    plt.close(fig)
+    buf.seek(0)
     return buf
 
 # ── Команды ───────────────────────────────────────────────────
@@ -182,31 +224,36 @@ def cmd_start(message):
 def cmd_price(message):
     data = get_cached()
     if not data:
-        bot.send_message(message.chat.id,"⏳ Загружаю данные, подожди ~10 сек.")
+        bot.send_message(message.chat.id, "⏳ Загружаю данные, подожди ~10 сек...")
         return
-    em=trend_emoji(data["change_24h"]); s="+" if data["change_24h"]>=0 else ""
-    caption=(f"💰 *HYPE / USD*\n\n"
-             f"Цена:         `${data['price']:.4f}`\n"
-             f"Изм. 24ч:  {em} `{s}{data['change_24h']:.2f}%`\n"
-             f"Макс. 24ч: `${data['high_24h']:.4f}`\n"
-             f"Мин. 24ч:   `${data['low_24h']:.4f}`")
-    candles=get_candles(4)
-    if candles and len(candles)>5:
+
+    em = trend_emoji(data["change_24h"])
+    s = "+" if data["change_24h"] >= 0 else ""
+    caption = (f"💰 *HYPE / USD*\n\n"
+               f"Цена:         `${data['price']:.4f}`\n"
+               f"Изм. 24ч:  {em} `{s}{data['change_24h']:.2f}%`\n"
+               f"Макс. 24ч: `${data['high_24h']:.4f}`\n"
+               f"Мин. 24ч:   `${data['low_24h']:.4f}`")
+
+    candles = get_candles(4)
+    if candles and len(candles) > 5:
         try:
-            bot.send_photo(message.chat.id,build_chart(candles,data["price"]),
-                           caption=caption,parse_mode="Markdown")
+            bot.send_photo(message.chat.id, build_chart(candles, data["price"]),
+                           caption=caption, parse_mode="Markdown")
             return
         except Exception as e:
             print(f"[Chart] error: {e}")
-    bot.send_message(message.chat.id,caption)
+    
+    bot.send_message(message.chat.id, caption)
 
 @bot.message_handler(func=lambda m: m.text == "📊 Статистика 24ч")
 def cmd_stats(message):
-    data=get_cached()
+    data = get_cached()
     if not data:
-        bot.send_message(message.chat.id,"⏳ Загружаю данные, подожди ~10 сек.")
+        bot.send_message(message.chat.id, "⏳ Загружаю данные, подожди ~10 сек...")
         return
-    s7="+" if data["change_7d"]>=0 else ""; s24="+" if data["change_24h"]>=0 else ""
+    s7 = "+" if data["change_7d"] >= 0 else ""
+    s24 = "+" if data["change_24h"] >= 0 else ""
     bot.send_message(message.chat.id,
         f"📊 *Статистика HYPE*\n\n"
         f"Объём 24ч:       `${data['volume']:,.0f}`\n"
@@ -216,29 +263,31 @@ def cmd_stats(message):
 
 @bot.message_handler(func=lambda m: m.text == "🔔 Уведомления 2%")
 def cmd_notify(message):
-    cid=message.chat.id
+    cid = message.chat.id
     if cid in subscribers:
-        bot.send_message(cid,"✅ Уведомления уже включены!\n\nПришлю сигнал если HYPE изменится на 2%+ за 10 минут.\n\nЧтобы отключить — нажми ❌ Отписаться")
+        bot.send_message(cid, "✅ Уведомления уже включены!\n\nПришлю сигнал если HYPE изменится на 2%+ за 10 минут.")
     else:
         subscribers.add(cid)
-        data=get_cached()
+        data = get_cached()
         if data:
-            sub_base[cid]=data["price"]
-        bot.send_message(cid,
-            f"✅ *Уведомления включены!*\n\n"
-            f"Пришлю сигнал если HYPE изменится на *2%+* за 10 минут.\n"
-            f"Текущая цена: `${data['price']:.4f}`" if data else
-            "✅ *Уведомления включены!*\n\nПришлю сигнал при изменении на 2%+ за 10 минут.")
+            sub_base[cid] = data["price"]
+        save_subscribers()
+        
+        msg = f"✅ *Уведомления включены!*\n\nПришлю сигнал если HYPE изменится на *2%+* за 10 минут.\n"
+        if data:
+            msg += f"Текущая цена: `${data['price']:.4f}`"
+        bot.send_message(cid, msg, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "❌ Отписаться")
 def cmd_unsub(message):
-    cid=message.chat.id
+    cid = message.chat.id
     if cid in subscribers:
         subscribers.discard(cid)
-        sub_base.pop(cid,None)
-        bot.send_message(cid,"✅ Уведомления отключены.")
+        sub_base.pop(cid, None)
+        save_subscribers()
+        bot.send_message(cid, "✅ Уведомления отключены.")
     else:
-        bot.send_message(cid,"ℹ️ У тебя не было активных уведомлений.")
+        bot.send_message(cid, "ℹ️ У тебя не было активных уведомлений.")
 
 @bot.message_handler(func=lambda m: m.text == "ℹ️ Помощь")
 def cmd_help(message):
@@ -252,63 +301,74 @@ def cmd_help(message):
 
 @bot.message_handler(func=lambda m: True)
 def fallback(message):
-    bot.send_message(message.chat.id,"🤔 Воспользуйся кнопками ниже.",reply_markup=main_markup())
+    bot.send_message(message.chat.id, "🤔 Воспользуйся кнопками ниже.", reply_markup=main_markup())
 
 # ── Монитор ───────────────────────────────────────────────────
 def price_monitor():
     global _latest, _price_history
-    print("[Monitor] первый запрос к CoinGecko...")
-    data=_fetch_hype()
+    print("[Monitor] Запуск мониторинга...")
+    
+    # Первый запрос
+    data = _fetch_hype()
     if data:
         with _cache_lock:
-            _latest=data
-        print(f"[Monitor] кэш заполнен: ${data['price']:.4f}")
+            _latest = data
+        print(f"[Monitor] Кэш инициализирован: ${data['price']:.4f}")
+
     while True:
         time.sleep(60)
-        data=_fetch_hype()
-        now=time.time()
-        if data:
-            with _cache_lock:
-                _latest=data
-                _price_history.append((data["price"],now))
-                _price_history=[(p,t) for p,t in _price_history if now-t<=900]
-                snap=list(_price_history)
-            for cid in list(subscribers):
-                old=[p for p,t in snap if 540<=now-t<=660]
-                base=old[0] if old else sub_base.get(cid,0)
-                if base>0:
-                    chg=(data["price"]-base)/base*100
-                    if abs(chg)>=2.0:
-                        d="вырос 🚀" if chg>0 else "упал 🔻"
-                        try:
-                            bot.send_message(cid,
-                                f"⚡ *СИГНАЛ: HYPE {d}*\n\n"
-                                f"Изменение за 10 мин: `{chg:+.2f}%`\n"
-                                f"Цена: `${data['price']:.4f}`\n"
-                                f"Было: `${base:.4f}`")
-                            sub_base[cid]=data["price"]
-                        except:
-                            subscribers.discard(cid)
-                            sub_base.pop(cid,None)
+        data = _fetch_hype()
+        if not data:
+            continue
 
-threading.Thread(target=price_monitor,daemon=True).start()
+        now = time.time()
+        with _cache_lock:
+            _latest = data
+            _price_history.append((data["price"], now))
+            _price_history = [(p, t) for p, t in _price_history if now - t <= 900]
+            snap = list(_price_history)
+
+        for cid in list(subscribers):
+            # Берем самую старую цену в интервале ~10 минут назад
+            old_prices = [p for p, t in snap if 540 <= now - t <= 660]
+            base = old_prices[0] if old_prices else sub_base.get(cid, 0)
+
+            if base > 0:
+                chg = (data["price"] - base) / base * 100
+                if abs(chg) >= 2.0:
+                    d = "вырос 🚀" if chg > 0 else "упал 🔻"
+                    try:
+                        bot.send_message(cid,
+                            f"⚡ *СИГНАЛ: HYPE {d}*\n\n"
+                            f"Изменение за 10 мин: `{chg:+.2f}%`\n"
+                            f"Цена: `${data['price']:.4f}`\n"
+                            f"Было: `${base:.4f}`")
+                        sub_base[cid] = data["price"]
+                        save_subscribers()
+                    except Exception:
+                        subscribers.discard(cid)
+                        sub_base.pop(cid, None)
+                        save_subscribers()
+
+# Загрузка подписчиков и запуск монитора
+load_subscribers()
+threading.Thread(target=price_monitor, daemon=True).start()
 
 # ── Запуск ────────────────────────────────────────────────────
 print("✅ Бот запущен...")
 if DOMAIN:
-    webhook_url=f"https://{DOMAIN}/{TOKEN}"
+    webhook_url = f"https://{DOMAIN}/{TOKEN}"
     bot.remove_webhook()
     time.sleep(1)
-    bot.set_webhook(url=webhook_url,
-                    allowed_updates=["message","callback_query"])
+    bot.set_webhook(url=webhook_url, allowed_updates=["message", "callback_query"])
     print(f"[Webhook] установлен: {webhook_url}")
-    app.run(host="0.0.0.0",port=PORT)
+    app.run(host="0.0.0.0", port=PORT)
 else:
-    print("[Polling] нет DOMAIN, используем polling")
+    print("[Polling] режим")
     bot.remove_webhook()
     while True:
         try:
-            bot.polling(none_stop=True,timeout=30,skip_pending=True)
+            bot.polling(none_stop=True, timeout=30, skip_pending=True)
         except Exception as e:
             print(f"[Polling] error: {e}")
             time.sleep(5)
