@@ -335,7 +335,7 @@ def price_monitor():
 
             if base > 0:
                 chg = (data["price"] - base) / base * 100
-                if abs(chg) >= 2.0:
+                if abs(chg) >= 0.1:
                     d = "вырос 🚀" if chg > 0 else "упал 🔻"
                     try:
                         bot.send_message(cid,
