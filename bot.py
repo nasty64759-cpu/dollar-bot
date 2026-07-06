@@ -149,6 +149,53 @@ def get_candles(hours=4):
     except Exception as e:
         print(f"[Candles] error: {e}")
     return None
+    
+    def get_pivot_levels():
+    """Берём последние 3 дневные свечи и считаем ключевые уровни"""
+    try:
+        now_ms   = int(time.time() * 1000)
+        start_ms = now_ms - 4 * 86400 * 1000  # 4 дня назад
+        r = requests.post("https://api.hyperliquid.xyz/info",
+            json={"type": "candleSnapshot",
+                  "req": {"coin": "HYPE", "interval": "1d",
+                          "startTime": start_ms, "endTime": now_ms}},
+            timeout=10)
+        days = r.json()
+        if not days or len(days) < 2:
+            return None
+
+        # Берём последние 3 завершённых дня (не текущий)
+        completed = days[:-1][-3:]
+
+        highs  = [float(d['h']) for d in completed]
+        lows   = [float(d['l']) for d in completed]
+        closes = [float(d['c']) for d in completed]
+
+        # Pivot на основе среднего за несколько дней
+        H = max(highs)
+        L = min(lows)
+        C = closes[-1]  # последний закрытый день
+
+        P  = (H + L + C) / 3
+        R1 = 2 * P - L
+        R2 = P + (H - L)
+        S1 = 2 * P - H
+        S2 = P - (H - L)
+
+        # Локальные экстремумы последних дней
+        local_high = max(highs[-2:])  # макс последних 2 дней
+        local_low  = min(lows[-2:])   # мин последних 2 дней
+
+        return {
+            "P": P, "R1": R1, "R2": R2, "S1": S1, "S2": S2,
+            "local_high": local_high, "local_low": local_low
+        }
+    except Exception as e:
+        print(f"[Pivots] error: {e}")
+        return None
+
+    
+    
 
 # ── График (увеличен шрифт цены) ─────────────────────────────
 def build_chart(candles, price):
@@ -176,6 +223,34 @@ def build_chart(candles, price):
         ax.plot([i, i], [max(oi, ci), hi], color=col, linewidth=1, zorder=2)
         av.add_patch(Rectangle((i-.3, 0), .6, vi, 
                              color='#1a4a47' if ci >= oi else '#4a1a1a', zorder=2))
+
+    # Получаем и рисуем уровни
+    levels = get_pivot_levels()
+    if levels:
+        ymin, ymax = min(l) - pp, max(h) + pp
+
+        def draw_level(val, color, label, ls='--', lw=0.8):
+            """Рисуем линию только если она в диапазоне графика"""
+            if ymin <= val <= ymax:
+                ax.axhline(val, color=color, linewidth=lw,
+                           linestyle=ls, zorder=3, alpha=0.8)
+                ax.text(n + 0.5, val, label, color=color,
+                        fontsize=7, va='center',
+                        bbox=dict(boxstyle='round,pad=0.2',
+                                  facecolor='#131722', edgecolor=color,
+                                  alpha=0.85))
+
+        # Глобальные уровни (Pivot Points)
+        draw_level(levels["R2"], '#ff4444', 'R2', lw=1.0)
+        draw_level(levels["R1"], '#ff8888', 'R1')
+        draw_level(levels["P"],  '#ffffff', ' P ', ls='-', lw=0.6)
+        draw_level(levels["S1"], '#88cc88', 'S1')
+        draw_level(levels["S2"], '#44aa44', 'S2', lw=1.0)
+
+        # Локальные уровни последних 2 дней
+        draw_level(levels["local_high"], '#ffaa00', 'LH', ls=':', lw=1.2)
+        draw_level(levels["local_low"],  '#00aaff', 'LL', ls=':', lw=1.2)
+
 
     # Увеличенный шрифт цены
     ax.axhline(price, color=PL, linewidth=1, linestyle='--', zorder=4)
