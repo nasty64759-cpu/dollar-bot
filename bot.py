@@ -149,8 +149,9 @@ def get_candles(hours=4):
     except Exception as e:
         print(f"[Candles] error: {e}")
     return None
-    
-    def get_pivot_levels():
+
+
+def get_pivot_levels():
     """Берём последние 3 дневные свечи и считаем ключевые уровни"""
     try:
         now_ms   = int(time.time() * 1000)
@@ -161,7 +162,7 @@ def get_candles(hours=4):
                           "startTime": start_ms, "endTime": now_ms}},
             timeout=10)
         days = r.json()
-        if not days or len(days) < 2:
+        if not isinstance(days, list) or len(days) < 2:
             return None
 
         # Берём последние 3 завершённых дня (не текущий)
@@ -171,10 +172,9 @@ def get_candles(hours=4):
         lows   = [float(d['l']) for d in completed]
         closes = [float(d['c']) for d in completed]
 
-        # Pivot на основе среднего за несколько дней
         H = max(highs)
         L = min(lows)
-        C = closes[-1]  # последний закрытый день
+        C = closes[-1]
 
         P  = (H + L + C) / 3
         R1 = 2 * P - L
@@ -182,9 +182,8 @@ def get_candles(hours=4):
         S1 = 2 * P - H
         S2 = P - (H - L)
 
-        # Локальные экстремумы последних дней
-        local_high = max(highs[-2:])  # макс последних 2 дней
-        local_low  = min(lows[-2:])   # мин последних 2 дней
+        local_high = max(highs[-2:]) if len(highs) >= 2 else H
+        local_low  = min(lows[-2:]) if len(lows) >= 2 else L
 
         return {
             "P": P, "R1": R1, "R2": R2, "S1": S1, "S2": S2,
@@ -194,10 +193,8 @@ def get_candles(hours=4):
         print(f"[Pivots] error: {e}")
         return None
 
-    
-    
 
-# ── График (увеличен шрифт цены) ─────────────────────────────
+# ── График ────────────────────────────────────────────────────
 def build_chart(candles, price):
     o=[c['o'] for c in candles]; h=[c['h'] for c in candles]
     l=[c['l'] for c in candles]; cl=[c['c'] for c in candles]
@@ -224,37 +221,32 @@ def build_chart(candles, price):
         av.add_patch(Rectangle((i-.3, 0), .6, vi, 
                              color='#1a4a47' if ci >= oi else '#4a1a1a', zorder=2))
 
-    # Получаем и рисуем уровни
+    # === УРОВНИ PIVOT ===
     levels = get_pivot_levels()
     if levels:
-        ymin, ymax = min(l) - pp, max(h) + pp
+        pp = (max(h) - min(l)) * 0.05
+        ymin = min(l) - pp
+        ymax = max(h) + pp
 
         def draw_level(val, color, label, ls='--', lw=0.8):
-            """Рисуем линию только если она в диапазоне графика"""
             if ymin <= val <= ymax:
-                ax.axhline(val, color=color, linewidth=lw,
-                           linestyle=ls, zorder=3, alpha=0.8)
-                ax.text(n + 0.5, val, label, color=color,
-                        fontsize=7, va='center',
-                        bbox=dict(boxstyle='round,pad=0.2',
-                                  facecolor='#131722', edgecolor=color,
-                                  alpha=0.85))
+                ax.axhline(val, color=color, linewidth=lw, linestyle=ls, zorder=3, alpha=0.8)
+                ax.text(n + 0.5, val, label, color=color, fontsize=7.5, va='center',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='#131722', 
+                                  edgecolor=color, alpha=0.85))
 
-        # Глобальные уровни (Pivot Points)
         draw_level(levels["R2"], '#ff4444', 'R2', lw=1.0)
         draw_level(levels["R1"], '#ff8888', 'R1')
-        draw_level(levels["P"],  '#ffffff', ' P ', ls='-', lw=0.6)
+        draw_level(levels["P"],  '#ffffff', ' P ', ls='-', lw=1.0)
         draw_level(levels["S1"], '#88cc88', 'S1')
         draw_level(levels["S2"], '#44aa44', 'S2', lw=1.0)
 
-        # Локальные уровни последних 2 дней
-        draw_level(levels["local_high"], '#ffaa00', 'LH', ls=':', lw=1.2)
-        draw_level(levels["local_low"],  '#00aaff', 'LL', ls=':', lw=1.2)
-
+        draw_level(levels["local_high"], '#ffaa00', 'LH', ls=':', lw=1.1)
+        draw_level(levels["local_low"],  '#00aaff', 'LL', ls=':', lw=1.1)
 
     # Увеличенный шрифт цены
     ax.axhline(price, color=PL, linewidth=1, linestyle='--', zorder=4)
-    ax.text(n + 0.8, price, f'${price:.4f}', color='#131722', fontsize=11,  # ← увеличен
+    ax.text(n + 0.8, price, f'${price:.4f}', color='#131722', fontsize=11,
             va='center', fontweight='bold',
             bbox=dict(boxstyle='round,pad=0.4', facecolor=PL, edgecolor='none'))
 
@@ -404,7 +396,6 @@ def price_monitor():
             snap = list(_price_history)
 
         for cid in list(subscribers):
-            # Берем самую старую цену в интервале ~10 минут назад
             old_prices = [p for p, t in snap if 540 <= now - t <= 660]
             base = old_prices[0] if old_prices else sub_base.get(cid, 0)
 
