@@ -155,22 +155,31 @@ def get_pivot_levels():
     """Берём последние 3 дневные свечи и считаем ключевые уровни"""
     try:
         now_ms   = int(time.time() * 1000)
-        start_ms = now_ms - 4 * 86400 * 1000  # 4 дня назад
+        start_ms = now_ms - 5 * 86400 * 1000  # 5 дней назад, с запасом
         r = requests.post("https://api.hyperliquid.xyz/info",
             json={"type": "candleSnapshot",
                   "req": {"coin": "HYPE", "interval": "1d",
                           "startTime": start_ms, "endTime": now_ms}},
-            timeout=10)
+            timeout=12)
+        
         days = r.json()
+        print(f"[Pivots] Получено дней: {len(days) if isinstance(days, list) else 'not list'}")  # ← для отладки
+
         if not isinstance(days, list) or len(days) < 2:
+            print("[Pivots] Недостаточно данных")
             return None
 
-        # Берём последние 3 завершённых дня (не текущий)
-        completed = days[:-1][-3:]
+        # Берём последние завершённые дни (убираем текущий неполный день)
+        completed = [d for d in days if d.get('c') and d.get('h') and d.get('l')]
+        if len(completed) < 2:
+            completed = days[-3:] if len(days) >= 3 else days
 
-        highs  = [float(d['h']) for d in completed]
-        lows   = [float(d['l']) for d in completed]
-        closes = [float(d['c']) for d in completed]
+        highs  = [float(d['h']) for d in completed[-3:]]
+        lows   = [float(d['l']) for d in completed[-3:]]
+        closes = [float(d['c']) for d in completed[-3:]]
+
+        if not highs:
+            return None
 
         H = max(highs)
         L = min(lows)
@@ -185,10 +194,13 @@ def get_pivot_levels():
         local_high = max(highs[-2:]) if len(highs) >= 2 else H
         local_low  = min(lows[-2:]) if len(lows) >= 2 else L
 
-        return {
+        result = {
             "P": P, "R1": R1, "R2": R2, "S1": S1, "S2": S2,
             "local_high": local_high, "local_low": local_low
         }
+        print(f"[Pivots] Успешно рассчитано. P={P:.2f}")
+        return result
+
     except Exception as e:
         print(f"[Pivots] error: {e}")
         return None
