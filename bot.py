@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from telebot import types
 from flask import Flask, request as flask_request
 
-TOKEN  = os.getenv("BOT_TOKEN", "TOKEN")
+TOKEN  = os.getenv("TOKEN")
 DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 PORT   = int(os.getenv("PORT", 8080))
 
