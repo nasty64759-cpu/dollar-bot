@@ -300,6 +300,7 @@ def cmd_start(message):
         reply_markup=main_markup())
 
 @bot.message_handler(func=lambda m: m.text == "💰 Курс HYPE")
+@bot.message_handler(func=lambda m: m.text == "💰 Курс HYPE")
 def cmd_price(message):
     data = get_cached()
     if not data:
@@ -308,11 +309,28 @@ def cmd_price(message):
 
     em = trend_emoji(data["change_24h"])
     s = "+" if data["change_24h"] >= 0 else ""
+    
+    # Получаем уровни
+    levels = get_pivot_levels()
+    levels_text = ""
+    if levels:
+        levels_text = (
+            f"\n\n*Ключевые уровни:*\n"
+            f"`R2: ${levels['R2']:.2f}`\n"
+            f"`R1: ${levels['R1']:.2f}`\n"
+            f"`P : ${levels['P']:.2f}`\n"
+            f"`S1: ${levels['S1']:.2f}`\n"
+            f"`S2: ${levels['S2']:.2f}`\n"
+            f"`LH : ${levels['local_high']:.2f}`\n"
+            f"`LL : ${levels['local_low']:.2f}`"
+        )
+
     caption = (f"💰 *HYPE / USD*\n\n"
                f"Цена:         `${data['price']:.4f}`\n"
                f"Изм. 24ч:  {em} `{s}{data['change_24h']:.2f}%`\n"
                f"Макс. 24ч: `${data['high_24h']:.4f}`\n"
-               f"Мин. 24ч:   `${data['low_24h']:.4f}`")
+               f"Мин. 24ч:   `${data['low_24h']:.4f}`"
+               f"{levels_text}")
 
     candles = get_candles(4)
     if candles and len(candles) > 5:
@@ -323,7 +341,8 @@ def cmd_price(message):
         except Exception as e:
             print(f"[Chart] error: {e}")
     
-    bot.send_message(message.chat.id, caption)
+    # Если график не отправился — отправляем только текст
+    bot.send_message(message.chat.id, caption, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "📊 Статистика 24ч")
 def cmd_stats(message):
