@@ -283,7 +283,7 @@ def build_chart(candles, price):
     av.yaxis.tick_right()
 
     chg = (cl[-1] - o[0]) / o[0] * 100
-    ax.set_title(f"HYPE/USDC  •  5м  •  4ч       {'+' if chg>=0 else ''}{chg:.2f}%",
+    ax.set_title(f"HYPE/USDC  •  5м  •  8ч       {'+' if chg>=0 else ''}{chg:.2f}%",
                  color=TEXT, fontsize=11, loc='left', pad=8, fontweight='bold')
 
     buf = io.BytesIO()
@@ -332,7 +332,7 @@ def cmd_price(message):
                f"Мин. 24ч:   `${data['low_24h']:.4f}`"
                f"{levels_text}")
 
-    candles = get_candles(4)
+    candles = get_candles(8)
     if candles and len(candles) > 5:
         try:
             bot.send_photo(message.chat.id, build_chart(candles, data["price"]),
