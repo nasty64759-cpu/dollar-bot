@@ -184,30 +184,19 @@ def get_pivot_levels():
         return None
 
 # ── Order Book (стакан) ───────────────────────────────────────
+
 def get_order_book():
-    """
-    Возвращает топ уровней биддов и асков с Hyperliquid.
-    Формат: {"bids": [(price, size), ...], "asks": [(price, size), ...]}
-    """
     try:
         r = requests.post("https://api.hyperliquid.xyz/info",
-            json={"type": "l2Book", "coin": "HYPE"}, timeout=10)
+            json={"type": "l2Book", "coin": "HYPE", "nSigFigs": 5}, timeout=10)
         data = r.json()
         levels = data.get("levels", [])
         if not levels or len(levels) < 2:
             return None
-
-        # levels[0] = биды, levels[1] = аски
-        bids_raw = levels[0]  # [{px, sz, n}, ...]
-        asks_raw = levels[1]
-
-        bids = [(float(b["px"]), float(b["sz"])) for b in bids_raw]
-        asks = [(float(a["px"]), float(a["sz"])) for a in asks_raw]
-
-        # Сортировка: биды по убыванию цены, аски по возрастанию
+        bids = [(float(b["px"]), float(b["sz"])) for b in levels[0]]
+        asks = [(float(a["px"]), float(a["sz"])) for a in levels[1]]
         bids.sort(key=lambda x: x[0], reverse=True)
         asks.sort(key=lambda x: x[0])
-
         print(f"[OrderBook] биды: {len(bids)}, аски: {len(asks)}")
         return {"bids": bids, "asks": asks}
     except Exception as e:
@@ -266,12 +255,8 @@ def check_walls_and_notify():
 
 # ── Тепловая карта стакана ────────────────────────────────────
 def build_heatmap(book: dict, current_price: float) -> io.BytesIO:
-    """
-    Горизонтальная гистограмма — тепловая карта стакана заявок.
-    Зелёные бары = покупки, красные = продажи.
-    """
-    bids = book["bids"][:20]  # топ-20 уровней
-    asks = book["asks"][:20]
+    bids = book["bids"][:40]
+    asks = book["asks"][:40]
 
     BG   = '#131722'
     TEXT = '#d1d4dc'
@@ -279,54 +264,55 @@ def build_heatmap(book: dict, current_price: float) -> io.BytesIO:
     DOWN = '#ef5350'
     WALL = '#f0c040'
 
-    fig, ax = plt.subplots(figsize=(10, 8), facecolor=BG)
+    fig, ax = plt.subplots(figsize=(10, 10), facecolor=BG)
     ax.set_facecolor(BG)
     ax.tick_params(colors=TEXT, labelsize=9)
     for s in ax.spines.values():
         s.set_color('#2a2e39')
 
-    # Средний объём для определения стен
     all_sizes = [s for _, s in bids + asks]
     avg_size  = sum(all_sizes) / len(all_sizes) if all_sizes else 1
 
-    # Рисуем аски (продажи) — выше текущей цены
-    ask_prices = [p for p, _ in asks]
-    ask_sizes  = [s for _, s in asks]
-    for i, (p, s) in enumerate(zip(ask_prices, ask_sizes)):
-        color = WALL if s >= avg_size * 3 else DOWN
-        ax.barh(p, s, height=(asks[0][0]-asks[-1][0])/len(asks)*0.8 if len(asks)>1 else 0.1,
-                color=color, alpha=0.85, zorder=3)
+    # Высота бара — фиксированная чтобы не перекрывались
+    bar_h = 0.003
 
-    # Рисуем биды (покупки) — ниже текущей цены
-    bid_prices = [p for p, _ in bids]
-    bid_sizes  = [s for _, s in bids]
-    for i, (p, s) in enumerate(zip(bid_prices, bid_sizes)):
+    for p, s in asks:
+        color = WALL if s >= avg_size * 3 else DOWN
+        ax.barh(p, s, height=bar_h, color=color, alpha=0.85, zorder=3)
+
+    for p, s in bids:
         color = WALL if s >= avg_size * 3 else UP
-        ax.barh(p, s, height=(bids[0][0]-bids[-1][0])/len(bids)*0.8 if len(bids)>1 else 0.1,
-                color=color, alpha=0.85, zorder=3)
+        ax.barh(p, s, height=bar_h, color=color, alpha=0.85, zorder=3)
 
     # Линия текущей цены
+    max_size = max(all_sizes) if all_sizes else 1
     ax.axhline(current_price, color='#f0c040', linewidth=1.5,
                linestyle='--', zorder=5)
-    ax.text(ax.get_xlim()[1] if ax.get_xlim()[1] != 0 else max(all_sizes)*0.95,
-            current_price, f' ${current_price:.2f}',
-            color='#f0c040', fontsize=9, va='center', fontweight='bold')
+    ax.text(max_size * 0.98, current_price,
+            f' ${current_price:.2f}',
+            color='#f0c040', fontsize=10, va='bottom', fontweight='bold')
+
+    # Фиксируем диапазон — ±2% от текущей цены
+    price_range = current_price * 0.02
+    ax.set_ylim(current_price - price_range, current_price + price_range)
+    ax.set_xlim(0, max_size * 1.1)
 
     ax.yaxis.grid(True, color='#1e2638', linewidth=0.5, zorder=0)
     ax.set_xlabel('Объём (HYPE)', color=TEXT, fontsize=9)
     ax.set_ylabel('Цена ($)', color=TEXT, fontsize=9)
-    ax.set_title('📖 Стакан заявок HYPE  •  топ-20 уровней\n'
-                 '🟢 Покупки    🔴 Продажи    🟡 Крупная стена',
-                 color=TEXT, fontsize=10, loc='left', pad=8)
+    ax.set_title(
+        f'📖 Стакан заявок HYPE  •  диапазон ±2% от цены\n'
+        f'🟢 Покупки    🔴 Продажи    🟡 Крупная стена (3x среднего)',
+        color=TEXT, fontsize=10, loc='left', pad=8)
 
-    # Легенда объёмов — подписываем самые крупные заявки
-    all_levels = [(p, s, 'buy') for p, s in bids] + [(p, s, 'sell') for p, s in asks]
-    top3 = sorted(all_levels, key=lambda x: x[1], reverse=True)[:3]
-    for price, size, side in top3:
+    # Подписываем топ-5 крупнейших заявок
+    all_levels = [(p, s) for p, s in bids + asks]
+    top5 = sorted(all_levels, key=lambda x: x[1], reverse=True)[:5]
+    for price, size in top5:
         ax.annotate(f'{size:,.0f}',
                     xy=(size, price),
-                    xytext=(5, 0), textcoords='offset points',
-                    color=TEXT, fontsize=7, va='center')
+                    xytext=(4, 0), textcoords='offset points',
+                    color=TEXT, fontsize=7.5, va='center')
 
     plt.tight_layout(pad=1.0)
     buf = io.BytesIO()
