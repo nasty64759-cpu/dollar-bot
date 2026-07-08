@@ -308,6 +308,98 @@ def calculate_bull_score(current_price, candles):
 
     return bull_score, sentiment, confidence
 
+# ── Распознавание ключевых свечей ─────────────────────────────
+def detect_candle_pattern(candles):
+    if len(candles) < 3:
+        return "none", 0
+    
+    last = candles[-1]
+    prev = candles[-2]
+    prev2 = candles[-3] if len(candles) > 2 else prev
+
+    o, h, l, c = last["o"], last["h"], last["l"], last["c"]
+    po, ph, pl, pc = prev["o"], prev["h"], prev["l"], prev["c"]
+
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    # Bullish Engulfing
+    if (o > c and po < pc and c > po and o < pc and body > (pc - po) * 0.7):
+        return "bullish_engulfing", 75
+
+    # Bearish Engulfing
+    if (o < c and po > pc and c < po and o > pc and body > (po - pc) * 0.7):
+        return "bearish_engulfing", 75
+
+    # Hammer
+    if lower_wick > body * 2 and upper_wick < body * 0.3 and c > o:
+        return "hammer", 70
+
+    # Shooting Star
+    if upper_wick > body * 2 and lower_wick < body * 0.3 and c < o:
+        return "shooting_star", 70
+
+    # Pinbar Bullish
+    if lower_wick > body * 2.5 and c > o:
+        return "pinbar_bullish", 65
+
+    return "none", 0
+
+
+# ── Конфлюэнс-анализ (Идеальные точки входа) ─────────────────
+def find_confluence_setup(current_price, candles, levels):
+    if not candles or not levels:
+        return None, None
+
+    bull_score, sentiment, _ = calculate_bull_score(current_price, candles)
+    pattern, pattern_strength = detect_candle_pattern(candles)
+    
+    book = get_order_book()
+    bid_walls = find_walls(book["bids"], 3.5) if book else []
+    ask_walls = find_walls(book["asks"], 3.5) if book else []
+
+    setup = None
+    strength = 0
+
+    # Бычий сетап
+    if (bull_score >= 70 and 
+        current_price <= levels.get("S1", 99999) * 1.008 and 
+        pattern in ["hammer", "bullish_engulfing", "pinbar_bullish"]):
+        
+        strength = bull_score + pattern_strength
+        setup = {
+            "direction": "LONG",
+            "strength": strength,
+            "level": "S1/S2",
+            "reason": f"{pattern.replace('_', ' ').title()} + высокий Bull Score",
+            "score": bull_score
+        }
+
+    # Медвежий сетап
+    elif (bull_score <= 38 and 
+          current_price >= levels.get("R1", 0) * 0.992 and 
+          pattern in ["shooting_star", "bearish_engulfing"]):
+        
+        strength = (100 - bull_score) + pattern_strength
+        setup = {
+            "direction": "SHORT",
+            "strength": strength,
+            "level": "R1/R2",
+            "reason": f"{pattern.replace('_', ' ').title()} + слабый Bull Score",
+            "score": bull_score
+        }
+
+    # Дополнительно — стена в стакане
+    if setup and bid_walls and setup["direction"] == "LONG":
+        setup["reason"] += " + крупная покупательная стена"
+        setup["strength"] += 12
+    elif setup and ask_walls and setup["direction"] == "SHORT":
+        setup["reason"] += " + крупная продающая стена"
+        setup["strength"] += 12
+
+    return setup, pattern
+
 # ── Order Book (стакан) ───────────────────────────────────────
 
 def get_order_book():
@@ -527,50 +619,47 @@ def cmd_start(message):
 def cmd_price(message):
     data = get_cached()
     if not data:
-        bot.send_message(message.chat.id, "⏳ Загружаю данные, подожди ~10 сек...")
+        bot.send_message(message.chat.id, "⏳ Загружаю данные...")
         return
 
     em = trend_emoji(data["change_24h"])
-    s  = "+" if data["change_24h"] >= 0 else ""
+    s = "+" if data["change_24h"] >= 0 else ""
 
-    # Получаем данные для прогноза
     candles = get_candles(6)
+    levels = get_pivot_levels()
+
     bull_score = 50
     sentiment = "Нейтральный"
     confidence = "50%"
+    setup_text = ""
 
-    if candles and len(candles) > 30:
+    if candles and len(candles) > 25:
         bull_score, sentiment, confidence = calculate_bull_score(data["price"], candles)
+        
+        setup, pattern = find_confluence_setup(data["price"], candles, levels)
+        if setup and setup["strength"] >= 75:
+            setup_text = (
+                f"\n\n🔥 *ИДЕАЛЬНАЯ ТОЧКА ВХОДА*\n"
+                f"**{setup['direction']}** — Сила: {setup['strength']}/100\n"
+                f"Уровень: {setup['level']}\n"
+                f"Причина: {setup['reason']}"
+            )
 
-    # Уровни
-    levels = get_pivot_levels()
+    # Основной текст
     levels_text = ""
     if levels:
-        levels_text = (
-            f"\n\n📊 *Ключевые уровни:*\n"
-            f"🔴 `R2: ${levels['R2']:.2f}`\n"
-            f"🟠 `R1: ${levels['R1']:.2f}`\n"
-            f"⚪ `P : ${levels['P']:.2f}`\n"
-            f"🟢 `S1: ${levels['S1']:.2f}`\n"
-            f"🔵 `S2: ${levels['S2']:.2f}`"
-        )
+        levels_text = f"\n\n📊 *Уровни:*\nR2: `${levels['R2']:.2f}` | R1: `${levels['R1']:.2f}`\nP: `${levels['P']:.2f}` | S1: `${levels['S1']:.2f}`"
 
-    # Прогноз
-    forecast_text = (
-        f"\n\n🔮 *Прогноз на 1–4 часа*\n"
-        f"**Bull Score: {bull_score}/100** — {sentiment}\n"
-        f"Вероятность роста: **{confidence}**"
-    )
+    forecast = f"\n\n🔮 *Прогноз 1-4ч*: **{sentiment}** (Bull Score: {bull_score}/100)"
 
     caption = (f"💰 *HYPE / USD*\n\n"
-               f"Цена:         `${data['price']:.4f}`\n"
-               f"Изм. 24ч:  {em} `{s}{data['change_24h']:.2f}%`\n"
-               f"Макс. 24ч: `${data['high_24h']:.4f}`\n"
-               f"Мин. 24ч:   `${data['low_24h']:.4f}`"
+               f"Цена: `${data['price']:.4f}`\n"
+               f"Изм.24ч: {em} `{s}{data['change_24h']:.2f}%`\n"
+               f"{forecast}"
                f"{levels_text}"
-               f"{forecast_text}")
+               f"{setup_text}")
 
-    if candles and len(candles) > 5:
+    if candles:
         try:
             bot.send_photo(message.chat.id, build_chart(candles, data["price"]),
                            caption=caption, parse_mode="Markdown")
