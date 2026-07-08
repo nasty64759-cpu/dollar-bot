@@ -299,7 +299,7 @@ def build_heatmap(book: dict, current_price: float) -> io.BytesIO:
             color='#f0c040', fontsize=10, va='bottom', fontweight='bold')
 
     # Диапазон ±1% — более реалистично для плотного стакана
-    price_range = current_price * 0.005
+    price_range = current_price * 0.002
     ax.set_ylim(current_price - price_range, current_price + price_range)
     ax.set_xlim(0, max_size * 1.15)
 
