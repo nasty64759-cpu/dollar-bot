@@ -469,9 +469,19 @@ def cmd_orderbook(message):
         bot.send_message(message.chat.id, "❌ Не удалось получить данные стакана.")
         return
 
-    price = data["price"]
-    bids  = book["bids"][:5]
-    asks  = book["asks"][:5]
+       # Берём цену из середины стакана — точнее чем CoinGecko
+    best_ask = book["asks"][0][0] if book["asks"] else None
+    best_bid = book["bids"][0][0] if book["bids"] else None
+    if best_ask and best_bid:
+        price = (best_ask + best_bid) / 2
+    else:
+        price = data["price"]
+
+    print(f"[OB] mid-price={price:.4f} best_bid={best_bid} best_ask={best_ask}")
+
+    bids = book["bids"][:5]
+    asks = book["asks"][:5]
+
 
     # Находим стены
     bid_walls = find_walls(book["bids"])
