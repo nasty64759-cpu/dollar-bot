@@ -272,9 +272,16 @@ def build_heatmap(book: dict, current_price: float) -> io.BytesIO:
 
     all_sizes = [s for _, s in bids + asks]
     avg_size  = sum(all_sizes) / len(all_sizes) if all_sizes else 1
+    max_size  = max(all_sizes) if all_sizes else 1
 
-    # Высота бара — фиксированная чтобы не перекрывались
-    bar_h = 0.003
+    # Считаем реальный шаг цены между уровнями
+    all_prices = sorted([p for p, _ in bids + asks])
+    if len(all_prices) > 1:
+        gaps = [all_prices[i+1] - all_prices[i]
+                for i in range(len(all_prices)-1) if all_prices[i+1] > all_prices[i]]
+        bar_h = min(gaps) * 0.85 if gaps else current_price * 0.0005
+    else:
+        bar_h = current_price * 0.0005
 
     for p, s in asks:
         color = WALL if s >= avg_size * 3 else DOWN
@@ -285,23 +292,22 @@ def build_heatmap(book: dict, current_price: float) -> io.BytesIO:
         ax.barh(p, s, height=bar_h, color=color, alpha=0.85, zorder=3)
 
     # Линия текущей цены
-    max_size = max(all_sizes) if all_sizes else 1
     ax.axhline(current_price, color='#f0c040', linewidth=1.5,
                linestyle='--', zorder=5)
     ax.text(max_size * 0.98, current_price,
             f' ${current_price:.2f}',
             color='#f0c040', fontsize=10, va='bottom', fontweight='bold')
 
-    # Фиксируем диапазон — ±2% от текущей цены
-    price_range = current_price * 0.02
+    # Диапазон ±1% — более реалистично для плотного стакана
+    price_range = current_price * 0.01
     ax.set_ylim(current_price - price_range, current_price + price_range)
-    ax.set_xlim(0, max_size * 1.1)
+    ax.set_xlim(0, max_size * 1.15)
 
     ax.yaxis.grid(True, color='#1e2638', linewidth=0.5, zorder=0)
     ax.set_xlabel('Объём (HYPE)', color=TEXT, fontsize=9)
     ax.set_ylabel('Цена ($)', color=TEXT, fontsize=9)
     ax.set_title(
-        f'📖 Стакан заявок HYPE  •  диапазон ±2% от цены\n'
+        f'📖 Стакан заявок HYPE  •  диапазон ±1% от цены\n'
         f'🟢 Покупки    🔴 Продажи    🟡 Крупная стена (3x среднего)',
         color=TEXT, fontsize=10, loc='left', pad=8)
 
