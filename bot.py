@@ -547,8 +547,8 @@ def check_walls_and_notify():
 
 # ── Тепловая карта стакана ────────────────────────────────────
 def build_heatmap(book: dict, current_price: float) -> io.BytesIO:
-    bids = book["bids"][:40]
-    asks = book["asks"][:40]
+    bids = book["bids"][:60]   # увеличил количество уровней
+    asks = book["asks"][:60]
 
     BG   = '#131722'
     TEXT = '#d1d4dc'
@@ -556,7 +556,7 @@ def build_heatmap(book: dict, current_price: float) -> io.BytesIO:
     DOWN = '#ef5350'
     WALL = '#f0c040'
 
-    fig, ax = plt.subplots(figsize=(10, 10), facecolor=BG)
+    fig, ax = plt.subplots(figsize=(11, 10), facecolor=BG)
     ax.set_facecolor(BG)
     ax.tick_params(colors=TEXT, labelsize=9)
     for s in ax.spines.values():
@@ -566,55 +566,47 @@ def build_heatmap(book: dict, current_price: float) -> io.BytesIO:
     avg_size  = sum(all_sizes) / len(all_sizes) if all_sizes else 1
     max_size  = max(all_sizes) if all_sizes else 1
 
-    # Считаем реальный шаг цены между уровнями
-    all_prices = sorted([p for p, _ in bids + asks])
-    if len(all_prices) > 1:
-        gaps = [all_prices[i+1] - all_prices[i]
-                for i in range(len(all_prices)-1) if all_prices[i+1] > all_prices[i]]
-        bar_h = min(gaps) * 0.85 if gaps else current_price * 0.0005
-    else:
-        bar_h = current_price * 0.0005
+    # Увеличенный диапазон — теперь ±0.8% (можно регулировать)
+    price_range = current_price * 0.008   # ← было 0.002, стало 0.008
 
     for p, s in asks:
         color = WALL if s >= avg_size * 3 else DOWN
-        ax.barh(p, s, height=bar_h, color=color, alpha=0.85, zorder=3)
+        ax.barh(p, s, height=current_price*0.0004, color=color, alpha=0.85, zorder=3)
 
     for p, s in bids:
         color = WALL if s >= avg_size * 3 else UP
-        ax.barh(p, s, height=bar_h, color=color, alpha=0.85, zorder=3)
+        ax.barh(p, s, height=current_price*0.0004, color=color, alpha=0.85, zorder=3)
 
     # Линия текущей цены
-    ax.axhline(current_price, color='#f0c040', linewidth=1.5,
+    ax.axhline(current_price, color='#f0c040', linewidth=1.8,
                linestyle='--', zorder=5)
-    ax.text(max_size * 0.98, current_price,
-            f' ${current_price:.2f}',
-            color='#f0c040', fontsize=10, va='bottom', fontweight='bold')
+    ax.text(max_size * 0.95, current_price + current_price*0.0005,
+            f' ${current_price:.2f} ← Текущая',
+            color='#f0c040', fontsize=11, va='bottom', fontweight='bold')
 
-    # Диапазон ±0.1% — более реалистично для плотного стакана
-    price_range = current_price * 0.002
     ax.set_ylim(current_price - price_range, current_price + price_range)
-    ax.set_xlim(0, max_size * 1.15)
+    ax.set_xlim(0, max_size * 1.18)
 
     ax.yaxis.grid(True, color='#1e2638', linewidth=0.5, zorder=0)
-    ax.set_xlabel('Объём (HYPE)', color=TEXT, fontsize=9)
-    ax.set_ylabel('Цена ($)', color=TEXT, fontsize=9)
+    ax.set_xlabel('Объём (HYPE)', color=TEXT, fontsize=10)
+    ax.set_ylabel('Цена ($)', color=TEXT, fontsize=10)
     ax.set_title(
-        f'📖 Стакан заявок HYPE  •  диапазон ±1% от цены\n'
+        f'📖 Стакан заявок HYPE  •  диапазон ±0.8% от цены\n'
         f'🟢 Покупки    🔴 Продажи    🟡 Крупная стена (3x среднего)',
-        color=TEXT, fontsize=10, loc='left', pad=8)
+        color=TEXT, fontsize=11, loc='left', pad=10)
 
-    # Подписываем топ-5 крупнейших заявок
+    # Подписи топ-стен
     all_levels = [(p, s) for p, s in bids + asks]
-    top5 = sorted(all_levels, key=lambda x: x[1], reverse=True)[:5]
+    top5 = sorted(all_levels, key=lambda x: x[1], reverse=True)[:6]
     for price, size in top5:
         ax.annotate(f'{size:,.0f}',
                     xy=(size, price),
-                    xytext=(4, 0), textcoords='offset points',
-                    color=TEXT, fontsize=7.5, va='center')
+                    xytext=(6, 0), textcoords='offset points',
+                    color=TEXT, fontsize=8, va='center', fontweight='bold')
 
-    plt.tight_layout(pad=1.0)
+    plt.tight_layout(pad=1.2)
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=130, facecolor=BG)
+    fig.savefig(buf, format='png', dpi=135, facecolor=BG)
     plt.close(fig)
     buf.seek(0)
     return buf
