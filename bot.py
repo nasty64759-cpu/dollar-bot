@@ -183,6 +183,131 @@ def get_pivot_levels():
         print(f"[Pivots] error: {e}")
         return None
 
+# ── RSI ───────────────────────────────────────────────────────
+def calculate_rsi(prices, period=14):
+    """Простой расчёт RSI"""
+    if len(prices) < period + 1:
+        return 50
+    gains = []
+    losses = []
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i-1]
+        if change > 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
+    
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period if sum(losses[-period:]) > 0 else 0.0001
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+# ── Bull / Bear Score ─────────────────────────────────────────
+def calculate_bull_score(current_price, candles):
+    """
+    Возвращает (bull_score 0-100, sentiment, explanation)
+    """
+    if not candles or len(candles) < 30:
+        return 50, "Нейтральный", "Недостаточно данных"
+
+    # Подготовка данных
+    closes = [c["c"] for c in candles]
+    volumes = [c["v"] for c in candles]
+    recent_closes = closes[-12:]      # последние ~60 минут (5m timeframe)
+    prev_closes = closes[-30:-12]
+
+    levels = get_pivot_levels()
+
+    # 1. Положение относительно Pivot (25%)
+    pivot_score = 50
+    if levels:
+        if current_price > levels.get("R1", current_price):
+            pivot_score = 88
+        elif current_price > levels.get("P", current_price):
+            pivot_score = 68
+        elif current_price < levels.get("S1", current_price):
+            pivot_score = 28
+        else:
+            pivot_score = 52
+
+    # 2. Импульс (20%)
+    change_30m = (current_price - recent_closes[0]) / recent_closes[0] * 100 if recent_closes else 0
+    change_60m = (current_price - closes[-25]) / closes[-25] * 100 if len(closes) > 25 else change_30m
+    momentum_score = 50 + change_30m * 2.8 + change_60m * 1.2
+    momentum_score = max(15, min(92, momentum_score))
+
+    # 3. RSI (15%)
+    rsi = calculate_rsi(closes[-40:])
+    rsi_score = 50
+    if rsi < 32:
+        rsi_score = 82
+    elif rsi < 45:
+        rsi_score = 65
+    elif rsi > 70:
+        rsi_score = 22
+    elif rsi > 62:
+        rsi_score = 38
+
+    # 4. Объём (15%)
+    avg_vol = sum(volumes[-48:]) / 48 if len(volumes) >= 48 else 1  # 4 часа
+    recent_vol = sum(volumes[-12:]) / 12 if len(volumes) >= 12 else 1
+    volume_ratio = recent_vol / avg_vol
+    volume_score = 50
+    if volume_ratio > 1.9:
+        volume_score = 82
+    elif volume_ratio > 1.4:
+        volume_score = 68
+
+    # 5. Близость к уровню (15%)
+    proximity_score = 50
+    if levels:
+        distances = [abs(current_price - lvl) for lvl in 
+                    [levels.get("R2"), levels.get("R1"), levels.get("P"), 
+                     levels.get("S1"), levels.get("S2")]]
+        closest = min(distances) / current_price
+        if closest < 0.006:      # очень близко (<0.6%)
+            proximity_score = 78
+        elif closest < 0.012:
+            proximity_score = 62
+
+    # 6. EMA тренд (10%)
+    ema_score = 55  # можно улучшить позже
+
+    # Итоговый расчёт
+    bull_score = (
+        pivot_score * 0.25 +
+        momentum_score * 0.20 +
+        rsi_score * 0.15 +
+        volume_score * 0.15 +
+        proximity_score * 0.15 +
+        ema_score * 0.10
+    )
+    bull_score = round(max(10, min(95, bull_score)))
+
+    # Определение sentiment
+    if bull_score >= 78:
+        sentiment = "Сильный бычий"
+        confidence = "68-74%"
+    elif bull_score >= 68:
+        sentiment = "Бычий"
+        confidence = "60-67%"
+    elif bull_score >= 55:
+        sentiment = "Скорее бычий"
+        confidence = "53-59%"
+    elif bull_score >= 45:
+        sentiment = "Нейтральный"
+        confidence = "48-52%"
+    else:
+        sentiment = "Медвежий"
+        confidence = "35-47%"
+
+    return bull_score, sentiment, confidence
+
 # ── Order Book (стакан) ───────────────────────────────────────
 
 def get_order_book():
@@ -404,33 +529,47 @@ def cmd_price(message):
     if not data:
         bot.send_message(message.chat.id, "⏳ Загружаю данные, подожди ~10 сек...")
         return
+
     em = trend_emoji(data["change_24h"])
     s  = "+" if data["change_24h"] >= 0 else ""
 
+    # Получаем данные для прогноза
+    candles = get_candles(6)
+    bull_score = 50
+    sentiment = "Нейтральный"
+    confidence = "50%"
+
+    if candles and len(candles) > 30:
+        bull_score, sentiment, confidence = calculate_bull_score(data["price"], candles)
+
+    # Уровни
     levels = get_pivot_levels()
     levels_text = ""
     if levels:
         levels_text = (
-            f"\n\n📊 *Ключевые уровни (Pivot Points):*\n"
-            f"🔴 `R2: ${levels['R2']:.2f}` — сильное сопротивление\n"
-            f"🟠 `R1: ${levels['R1']:.2f}` — сопротивление\n"
-            f"⚪ `P : ${levels['P']:.2f}` — центральный пивот\n"
-            f"🟢 `S1: ${levels['S1']:.2f}` — поддержка\n"
-            f"🔵 `S2: ${levels['S2']:.2f}` — сильная поддержка\n"
-            f"\n🟡 `LH: ${levels['local_high']:.2f}` — локальный максимум (2 дня)\n"
-            f"🔷 `LL: ${levels['local_low']:.2f}` — локальный минимум (2 дня)"
+            f"\n\n📊 *Ключевые уровни:*\n"
+            f"🔴 `R2: ${levels['R2']:.2f}`\n"
+            f"🟠 `R1: ${levels['R1']:.2f}`\n"
+            f"⚪ `P : ${levels['P']:.2f}`\n"
+            f"🟢 `S1: ${levels['S1']:.2f}`\n"
+            f"🔵 `S2: ${levels['S2']:.2f}`"
         )
 
-    caption = (
-        f"💰 *HYPE / USD*\n\n"
-        f"Цена:         `${data['price']:.4f}`\n"
-        f"Изм. 24ч:  {em} `{s}{data['change_24h']:.2f}%`\n"
-        f"Макс. 24ч: `${data['high_24h']:.4f}`\n"
-        f"Мин. 24ч:   `${data['low_24h']:.4f}`"
-        f"{levels_text}"
+    # Прогноз
+    forecast_text = (
+        f"\n\n🔮 *Прогноз на 1–4 часа*\n"
+        f"**Bull Score: {bull_score}/100** — {sentiment}\n"
+        f"Вероятность роста: **{confidence}**"
     )
 
-    candles = get_candles(6)
+    caption = (f"💰 *HYPE / USD*\n\n"
+               f"Цена:         `${data['price']:.4f}`\n"
+               f"Изм. 24ч:  {em} `{s}{data['change_24h']:.2f}%`\n"
+               f"Макс. 24ч: `${data['high_24h']:.4f}`\n"
+               f"Мин. 24ч:   `${data['low_24h']:.4f}`"
+               f"{levels_text}"
+               f"{forecast_text}")
+
     if candles and len(candles) > 5:
         try:
             bot.send_photo(message.chat.id, build_chart(candles, data["price"]),
@@ -438,6 +577,7 @@ def cmd_price(message):
             return
         except Exception as e:
             print(f"[Chart] error: {e}")
+
     bot.send_message(message.chat.id, caption, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "📊 Статистика 24ч")
