@@ -432,6 +432,81 @@ def find_walls(levels, threshold_multiplier=3.0):
     walls = [(p, s) for p, s in levels if s >= avg * threshold_multiplier]
     return sorted(walls, key=lambda x: x[1], reverse=True)
 
+# ── Улучшенный анализ стакана ─────────────────────────────────
+def analyze_orderbook(book):
+    if not book:
+        return None
+    
+    bids = book["bids"][:30]
+    asks = book["asks"][:30]
+    
+    # Объём на покупку и продажу
+    bid_volume = sum(s for _, s in bids)
+    ask_volume = sum(s for _, s in asks)
+    
+    # Delta
+    delta = bid_volume - ask_volume
+    delta_ratio = delta / (bid_volume + ask_volume) if (bid_volume + ask_volume) > 0 else 0
+    
+    # Imbalance (дисбаланс)
+    imbalance = None
+    if bid_volume > ask_volume * 1.8:
+        imbalance = "strong_bid"
+    elif ask_volume > bid_volume * 1.8:
+        imbalance = "strong_ask"
+    elif bid_volume > ask_volume * 1.35:
+        imbalance = "bid"
+    elif ask_volume > bid_volume * 1.35:
+        imbalance = "ask"
+    
+    # Крупные стены
+    bid_walls = find_walls(bids, 3.5)
+    ask_walls = find_walls(asks, 3.5)
+    
+    return {
+        "delta": delta,
+        "delta_ratio": delta_ratio,
+        "imbalance": imbalance,
+        "bid_volume": bid_volume,
+        "ask_volume": ask_volume,
+        "bid_walls": bid_walls,
+        "ask_walls": ask_walls
+    }
+
+
+def get_orderbook_summary(analysis, current_price):
+    if not analysis:
+        return "Не удалось проанализировать стакан."
+    
+    text = ""
+    
+    # Delta
+    delta_sign = "🟢" if analysis["delta"] > 0 else "🔴"
+    text += f"{delta_sign} **Delta**: {analysis['delta']:,.0f} HYPE ({analysis['delta_ratio']:+.1%})\n"
+    
+    # Imbalance
+    if analysis["imbalance"] == "strong_bid":
+        text += "🟢 **Сильный дисбаланс в покупках**\n"
+    elif analysis["imbalance"] == "strong_ask":
+        text += "🔴 **Сильный дисбаланс в продажах**\n"
+    elif analysis["imbalance"] == "bid":
+        text += "🟢 Небольшой перевес покупателей\n"
+    elif analysis["imbalance"] == "ask":
+        text += "🔴 Небольшой перевес продавцов\n"
+    
+    # Стены
+    if analysis["bid_walls"]:
+        text += "\n🟢 **Крупные стены на покупку:**\n"
+        for p, s in analysis["bid_walls"][:2]:
+            text += f"  `${p:.2f}` — {s:,.0f} HYPE\n"
+    
+    if analysis["ask_walls"]:
+        text += "\n🔴 **Крупные стены на продажу:**\n"
+        for p, s in analysis["ask_walls"][:2]:
+            text += f"  `${p:.2f}` — {s:,.0f} HYPE\n"
+    
+    return text
+
 # ── Мониторинг стен ───────────────────────────────────────────
 _last_wall_alert: dict[int, float] = {}  # chat_id -> timestamp последнего алерта
 
@@ -691,63 +766,30 @@ def cmd_orderbook(message):
         bot.send_message(message.chat.id, "⏳ Загружаю данные...")
         return
 
-    bot.send_message(message.chat.id, "⏳ Загружаю стакан заявок...")
+    bot.send_message(message.chat.id, "⏳ Анализирую стакан...")
 
     book = get_order_book()
     if not book:
-        bot.send_message(message.chat.id, "❌ Не удалось получить данные стакана.")
+        bot.send_message(message.chat.id, "❌ Не удалось получить стакан.")
         return
 
-       # Берём цену из середины стакана — точнее чем CoinGecko
-    best_ask = book["asks"][0][0] if book["asks"] else None
-    best_bid = book["bids"][0][0] if book["bids"] else None
-    if best_ask and best_bid:
-        price = (best_ask + best_bid) / 2
-    else:
-        price = data["price"]
+    # Анализ
+    analysis = analyze_orderbook(book)
+    best_ask = book["asks"][0][0] if book["asks"] else data["price"]
+    best_bid = book["bids"][0][0] if book["bids"] else data["price"]
+    mid_price = (best_ask + best_bid) / 2
 
-    print(f"[OB] mid-price={price:.4f} best_bid={best_bid} best_ask={best_ask}")
+    # Текстовый стакан
+    text = f"📖 *Стакан заявок HYPE*\n_Средняя цена: ${mid_price:.4f}_\n\n"
+    text += get_orderbook_summary(analysis, mid_price)
 
-    bids = book["bids"][:5]
-    asks = book["asks"][:5]
-
-
-    # Находим стены
-    bid_walls = find_walls(book["bids"])
-    ask_walls = find_walls(book["asks"])
-
-    # Текст стакана
-    text = f"📖 *Стакан заявок HYPE*\n_Текущая цена: ${price:.4f}_\n\n"
-
-    text += "🔴 *Продажи (сопротивление):*\n"
-    for p, s in reversed(asks):
-        wall_mark = " 🧱" if any(abs(p - wp) < 0.01 for wp, _ in ask_walls) else ""
-        text += f"`${p:.2f}` — {s:,.1f} HYPE{wall_mark}\n"
-
-    text += f"\n⚡ *Текущая цена: ${price:.4f}*\n\n"
-
-    text += "🟢 *Покупки (поддержка):*\n"
-    for p, s in bids:
-        wall_mark = " 🧱" if any(abs(p - wp) < 0.01 for wp, _ in bid_walls) else ""
-        text += f"`${p:.2f}` — {s:,.1f} HYPE{wall_mark}\n"
-
-    # Крупные стены отдельно
-    if bid_walls or ask_walls:
-        text += "\n🧱 *Крупные стены:*\n"
-        for p, s in ask_walls[:2]:
-            text += f"🔴 `${p:.2f}` — {s:,.0f} HYPE (продажа)\n"
-        for p, s in bid_walls[:2]:
-            text += f"🟢 `${p:.2f}` — {s:,.0f} HYPE (покупка)\n"
-
-    # Отправляем текст
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
-    # Отправляем тепловую карту отдельным фото
+    # Тепловая карта
     try:
-        heatmap = build_heatmap(book, price)
+        heatmap = build_heatmap(book, mid_price)
         bot.send_photo(message.chat.id, heatmap,
-                       caption="🌡 *Тепловая карта стакана*\n"
-                               "🟡 Жёлтый = крупная стена (в 3+ раз больше среднего)",
+                       caption="🌡 *Тепловая карта стакана*\n🟡 = крупная стена", 
                        parse_mode="Markdown")
     except Exception as e:
         print(f"[Heatmap] error: {e}")
