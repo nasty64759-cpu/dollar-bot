@@ -67,6 +67,10 @@ def health():
 _cache_lock = threading.Lock()
 _latest: dict | None = None
 _price_history: list = []
+# Для быстрого трекинга (график)
+_fast_snapshots = []        # список последних 75 снимков
+# Для долгоживущих стен
+_persistent_walls = {}      # price -> {"size": , "first_seen": , "side": }
 
 def get_cached():
     with _cache_lock:
@@ -432,6 +436,71 @@ def find_walls(levels, threshold_multiplier=3.0):
     walls = [(p, s) for p, s in levels if s >= avg * threshold_multiplier]
     return sorted(walls, key=lambda x: x[1], reverse=True)
 
+def take_fast_snapshot(book):
+    """Быстрый снимок для графика (каждые 8 сек)"""
+    global _fast_snapshots
+    if not book:
+        return
+    
+    snapshot = {
+        "timestamp": time.time(),
+        "bids": {round(p, 2): s for p, s in book["bids"][:60]},
+        "asks": {round(p, 2): s for p, s in book["asks"][:60]}
+    }
+    
+    _fast_snapshots.append(snapshot)
+    if len(_fast_snapshots) > 75:
+        _fast_snapshots.pop(0)
+
+
+def calculate_average_book():
+    """Считает средний объём по уровням за последние снимки"""
+    if not _fast_snapshots:
+        return None
+    
+    bid_vol = {}
+    ask_vol = {}
+    
+    for snap in _fast_snapshots:
+        for p, s in snap["bids"].items():
+            bid_vol[p] = bid_vol.get(p, 0) + s
+        for p, s in snap["asks"].items():
+            ask_vol[p] = ask_vol.get(p, 0) + s
+    
+    # Среднее
+    avg_bids = {p: v / len(_fast_snapshots) for p, v in bid_vol.items()}
+    avg_asks = {p: v / len(_fast_snapshots) for p, v in ask_vol.items()}
+    
+    return {"bids": avg_bids, "asks": avg_asks}
+
+
+def track_persistent_walls(book):
+    """Отслеживает долгоживущие стены"""
+    global _persistent_walls
+    now = time.time()
+    
+    if not book:
+        return
+    
+    # Очищаем старые (> 40 минут)
+    for p in list(_persistent_walls.keys()):
+        if now - _persistent_walls[p]["first_seen"] > 2400:
+            del _persistent_walls[p]
+    
+    for side, levels in [("bid", book["bids"][:40]), ("ask", book["asks"][:40])]:
+        for price, size in find_walls(levels, 3.0):
+            p = round(price, 2)
+            if p in _persistent_walls:
+                _persistent_walls[p]["size"] = max(_persistent_walls[p]["size"], size)
+                _persistent_walls[p]["last_seen"] = now
+            else:
+                _persistent_walls[p] = {
+                    "size": size,
+                    "first_seen": now,
+                    "last_seen": now,
+                    "side": side
+                }
+                
 # ── Улучшенный анализ стакана ─────────────────────────────────
 def analyze_orderbook(book):
     if not book:
@@ -755,7 +824,7 @@ def cmd_stats(message):
 def cmd_orderbook(message):
     data = get_cached()
     if not data:
-        bot.send_message(message.chat.id, "⏳ Загружаю данные...")
+        bot.send_message(message.chat.id, "⏳ Загружаю...")
         return
 
     bot.send_message(message.chat.id, "⏳ Анализирую стакан...")
@@ -765,24 +834,37 @@ def cmd_orderbook(message):
         bot.send_message(message.chat.id, "❌ Не удалось получить стакан.")
         return
 
-    # Анализ
-    analysis = analyze_orderbook(book)
-    best_ask = book["asks"][0][0] if book["asks"] else data["price"]
-    best_bid = book["bids"][0][0] if book["bids"] else data["price"]
-    mid_price = (best_ask + best_bid) / 2
+    take_fast_snapshot(book)
+    track_persistent_walls(book)
 
-    # Текстовый стакан
-    text = f"📖 *Стакан заявок HYPE*\n_Средняя цена: ${mid_price:.4f}_\n\n"
+    analysis = analyze_orderbook(book)
+    mid_price = (book["asks"][0][0] + book["bids"][0][0]) / 2 if book["asks"] and book["bids"] else data["price"]
+
+    text = f"📖 *Стакан заявок HYPE*\n_Цена ≈ ${mid_price:.4f}_\n\n"
     text += get_orderbook_summary(analysis, mid_price)
+
+    # Долгоживущие стены
+    now = time.time()
+    persistent = []
+    for price, info in sorted(_persistent_walls.items(), key=lambda x: x[1]["first_seen"]):
+        duration = int((now - info["first_seen"]) / 60)
+        if duration >= 5:
+            emoji = "🟢" if info["side"] == "bid" else "🔴"
+            persistent.append(f"{emoji} `${price:.2f}` — {info['size']:,.0f} HYPE ({duration} мин)")
+
+    if persistent:
+        text += f"\n\n🕒 *Устойчивые стены (≥5 мин):*\n" + "\n".join(persistent[:7])
 
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
-    # Тепловая карта
+    # График на основе среднего
     try:
-        heatmap = build_heatmap(book, mid_price)
-        bot.send_photo(message.chat.id, heatmap,
-                       caption="🌡 *Тепловая карта стакана*\n🟡 = крупная стена", 
-                       parse_mode="Markdown")
+        avg_book = calculate_average_book()
+        if avg_book:
+            # Временная замена для графика (можно улучшить позже)
+            fake_book = {"bids": list(avg_book["bids"].items()), "asks": list(avg_book["asks"].items())}
+            heatmap = build_heatmap(fake_book, mid_price)
+            bot.send_photo(message.chat.id, heatmap, caption="🌡 *Усреднённая тепловая карта (75 снимков)*", parse_mode="Markdown")
     except Exception as e:
         print(f"[Heatmap] error: {e}")
 
