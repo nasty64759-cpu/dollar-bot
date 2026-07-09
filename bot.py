@@ -843,15 +843,14 @@ def cmd_orderbook(message):
             persistent.append(f"{emoji} `${price:.2f}` — {info['size']:,.0f} HYPE ({duration} мин)")
 
     if persistent:
-        text += f"\n\n🕒 *Устойчивые стены (≥5 мин):*\n" + "\n".join(persistent[:7])
+        text += f"\n\n🕒 *Устойчивые стены (≥5 мин):*\n" + "\n".join(persistent[:8])
 
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
-    # График на основе среднего
+    # График
     try:
         avg_book = calculate_average_book()
         if avg_book:
-            # Временная замена для графика (можно улучшить позже)
             fake_book = {"bids": list(avg_book["bids"].items()), "asks": list(avg_book["asks"].items())}
             heatmap = build_heatmap(fake_book, mid_price)
             bot.send_photo(message.chat.id, heatmap, caption="🌡 *Усреднённая тепловая карта (75 снимков)*", parse_mode="Markdown")
