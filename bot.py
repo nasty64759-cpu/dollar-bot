@@ -965,6 +965,17 @@ def price_monitor():
                         sub_base.pop(cid, None)
                         save_subscribers()
 
+        # Автоматический трекинг стакана
+        _wall_check_counter += 1
+        if _wall_check_counter % 2 == 0:   # каждые ~2 минуты
+            try:
+                book = get_order_book()
+                if book:
+                    take_fast_snapshot(book)
+                    track_persistent_walls(book)
+            except:
+                pass
+
         # Проверка стен — каждые 5 минут
         _wall_check_counter += 1
         if _wall_check_counter >= 5 and subscribers:
