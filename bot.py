@@ -976,7 +976,6 @@ def price_monitor():
                 pass
 
         # Проверка стен — каждые 5 минут
-        _wall_check_counter += 1
         if _wall_check_counter >= 5 and subscribers:
             _wall_check_counter = 0
             try:
