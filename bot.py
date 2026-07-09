@@ -63,14 +63,18 @@ def _handle(data):
 def health():
     return "HYPE Bot running", 200
 
-# ── Кэш ──────────────────────────────────────────────────────
+# ── Кэш цены ─────────────────────────────────────────────────
 _cache_lock = threading.Lock()
 _latest: dict | None = None
-_price_history: list = []
-# Для быстрого трекинга (график)
-_fast_snapshots = []        # список последних 75 снимков
-# Для долгоживущих стен
-_persistent_walls = {}      # price -> {"size": , "first_seen": , "side": }
+_price_history: list = []  # [(price, timestamp)]
+
+# ── Снимки стакана (75 штук, каждые 8 сек) ───────────────────
+_fast_snapshots = []       # для тепловой карты, макс 75
+_fast_snap_lock = threading.Lock()
+
+# ── Долгоживущие стены (снимок каждые 30 сек, 4 часа) ────────
+_persistent_walls = {}     # price -> {size, first_seen, last_seen, side}
+_wall_snap_lock   = threading.Lock()
 
 def get_cached():
     with _cache_lock:
@@ -78,17 +82,20 @@ def get_cached():
 
 # ── Подписчики ────────────────────────────────────────────────
 SUBS_FILE = "subscribers.json"
-subscribers: set = set()
-sub_base: dict[int, float] = {}
+subscribers: set      = set()
+sub_base: dict        = {}
+bull_subscribers: set = set()  # подписчики на Bull Score 60+
 
 def load_subscribers():
-    global subscribers, sub_base
+    global subscribers, sub_base, bull_subscribers
     try:
         with open(SUBS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             subscribers.update(data.get("subscribers", []))
             sub_base.update({int(k): v for k, v in data.get("sub_base", {}).items()})
-        print(f"[Subs] Загружено {len(subscribers)} подписчиков")
+            bull_subscribers.update(data.get("bull_subscribers", []))
+        print(f"[Subs] Загружено {len(subscribers)} подписчиков, "
+              f"{len(bull_subscribers)} bull-подписчиков")
     except Exception:
         pass
 
@@ -96,8 +103,9 @@ def save_subscribers():
     try:
         with open(SUBS_FILE, "w", encoding="utf-8") as f:
             json.dump({
-                "subscribers": list(subscribers),
-                "sub_base": sub_base
+                "subscribers":      list(subscribers),
+                "sub_base":         sub_base,
+                "bull_subscribers": list(bull_subscribers),
             }, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[Subs] Ошибка сохранения: {e}")
@@ -105,9 +113,10 @@ def save_subscribers():
 # ── Меню ─────────────────────────────────────────────────────
 def main_markup():
     m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    m.add("💰 Курс HYPE", "📊 Статистика 24ч")
-    m.add("📖 Стакан заявок", "🔔 Уведомления 1%")
-    m.add("❌ Отписаться", "ℹ️ Помощь")
+    m.add("💰 Курс HYPE",      "📊 Статистика 24ч")
+    m.add("📖 Стакан заявок",  "🔔 Уведомления 1%")
+    m.add("🐂 Bull Score 60+", "❌ Отписаться")
+    m.add("ℹ️ Помощь")
     return m
 
 # ── CoinGecko ─────────────────────────────────────────────────
@@ -115,11 +124,9 @@ def _fetch_hype():
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/coins/hyperliquid",
-            timeout=12
-        )
+            timeout=12)
         r.raise_for_status()
         d = r.json()["market_data"]
-        print(f"[CoinGecko] Успешно получено")
         return {
             "price":      d["current_price"]["usd"],
             "volume":     d["total_volume"]["usd"],
@@ -148,7 +155,8 @@ def get_candles(hours=6):
         if isinstance(raw, list) and len(raw) > 5:
             print(f"[Candles] OK: {len(raw)}")
             return [{"t":c["t"],"o":float(c["o"]),"h":float(c["h"]),
-                     "l":float(c["l"]),"c":float(c["c"]),"v":float(c["v"])} for c in raw]
+                     "l":float(c["l"]),"c":float(c["c"]),"v":float(c["v"])}
+                    for c in raw]
     except Exception as e:
         print(f"[Candles] error: {e}")
     return None
@@ -156,12 +164,12 @@ def get_candles(hours=6):
 # ── Pivot Points ──────────────────────────────────────────────
 def get_pivot_levels():
     try:
-        now_ms   = int(time.time() * 1000)
-        start_ms = now_ms - 5 * 86400 * 1000
+        now_ms   = int(time.time()*1000)
+        start_ms = now_ms - 5*86400*1000
         r = requests.post("https://api.hyperliquid.xyz/info",
-            json={"type": "candleSnapshot",
-                  "req": {"coin": "HYPE", "interval": "1d",
-                          "startTime": start_ms, "endTime": now_ms}},
+            json={"type":"candleSnapshot",
+                  "req":{"coin":"HYPE","interval":"1d",
+                         "startTime":start_ms,"endTime":now_ms}},
             timeout=12)
         days = r.json()
         if not isinstance(days, list) or len(days) < 2:
@@ -175,555 +183,354 @@ def get_pivot_levels():
         if not highs:
             return None
         H = max(highs); L = min(lows); C = closes[-1]
-        P  = (H + L + C) / 3
-        R1 = 2 * P - L
-        R2 = P + (H - L)
-        S1 = 2 * P - H
-        S2 = P - (H - L)
-        local_high = max(highs[-2:]) if len(highs) >= 2 else H
-        local_low  = min(lows[-2:])  if len(lows)  >= 2 else L
-        return {"P": P, "R1": R1, "R2": R2, "S1": S1, "S2": S2,
-                "local_high": local_high, "local_low": local_low}
+        P  = (H+L+C)/3
+        R1 = 2*P-L;  R2 = P+(H-L)
+        S1 = 2*P-H;  S2 = P-(H-L)
+        return {"P":P,"R1":R1,"R2":R2,"S1":S1,"S2":S2,
+                "local_high": max(highs[-2:]) if len(highs)>=2 else H,
+                "local_low":  min(lows[-2:])  if len(lows) >=2 else L}
     except Exception as e:
         print(f"[Pivots] error: {e}")
         return None
 
 # ── RSI ───────────────────────────────────────────────────────
 def calculate_rsi(prices, period=14):
-    """Простой расчёт RSI"""
-    if len(prices) < period + 1:
+    if len(prices) < period+1:
         return 50
-    gains = []
-    losses = []
+    gains, losses = [], []
     for i in range(1, len(prices)):
-        change = prices[i] - prices[i-1]
-        if change > 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
-    
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period if sum(losses[-period:]) > 0 else 0.0001
-    
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+        ch = prices[i]-prices[i-1]
+        gains.append(ch if ch>0 else 0)
+        losses.append(-ch if ch<0 else 0)
+    ag = sum(gains[-period:])/period
+    al = sum(losses[-period:])/period or 0.0001
+    return 100-(100/(1+ag/al))
 
-
-# ── Bull / Bear Score ─────────────────────────────────────────
+# ── Bull Score ────────────────────────────────────────────────
 def calculate_bull_score(current_price, candles):
-    """
-    Возвращает (bull_score 0-100, sentiment, explanation)
-    """
     if not candles or len(candles) < 30:
-        return 50, "Нейтральный", "Недостаточно данных"
-
-    # Подготовка данных
-    closes = [c["c"] for c in candles]
+        return 50, "Нейтральный", "50%"
+    closes  = [c["c"] for c in candles]
     volumes = [c["v"] for c in candles]
-    recent_closes = closes[-12:]      # последние ~60 минут (5m timeframe)
-    prev_closes = closes[-30:-12]
+    levels  = get_pivot_levels()
 
-    levels = get_pivot_levels()
-
-    # 1. Положение относительно Pivot (25%)
+    # 1. Pivot
     pivot_score = 50
     if levels:
-        if current_price > levels.get("R1", current_price):
-            pivot_score = 88
-        elif current_price > levels.get("P", current_price):
-            pivot_score = 68
-        elif current_price < levels.get("S1", current_price):
-            pivot_score = 28
-        else:
-            pivot_score = 52
+        if current_price > levels["R1"]:   pivot_score = 88
+        elif current_price > levels["P"]:  pivot_score = 68
+        elif current_price < levels["S1"]: pivot_score = 28
+        else:                              pivot_score = 52
 
-    # 2. Импульс (20%)
-    change_30m = (current_price - recent_closes[0]) / recent_closes[0] * 100 if recent_closes else 0
-    change_60m = (current_price - closes[-25]) / closes[-25] * 100 if len(closes) > 25 else change_30m
-    momentum_score = 50 + change_30m * 2.8 + change_60m * 1.2
-    momentum_score = max(15, min(92, momentum_score))
+    # 2. Импульс
+    ch30 = (current_price-closes[-12])/closes[-12]*100 if len(closes)>=12 else 0
+    ch60 = (current_price-closes[-25])/closes[-25]*100 if len(closes)>=25 else ch30
+    momentum_score = max(15, min(92, 50 + ch30*2.8 + ch60*1.2))
 
-    # 3. RSI (15%)
+    # 3. RSI
     rsi = calculate_rsi(closes[-40:])
     rsi_score = 50
-    if rsi < 32:
-        rsi_score = 82
-    elif rsi < 45:
-        rsi_score = 65
-    elif rsi > 70:
-        rsi_score = 22
-    elif rsi > 62:
-        rsi_score = 38
+    if rsi < 32:    rsi_score = 82
+    elif rsi < 45:  rsi_score = 65
+    elif rsi > 70:  rsi_score = 22
+    elif rsi > 62:  rsi_score = 38
 
-    # 4. Объём (15%)
-    avg_vol = sum(volumes[-48:]) / 48 if len(volumes) >= 48 else 1  # 4 часа
-    recent_vol = sum(volumes[-12:]) / 12 if len(volumes) >= 12 else 1
-    volume_ratio = recent_vol / avg_vol
-    volume_score = 50
-    if volume_ratio > 1.9:
-        volume_score = 82
-    elif volume_ratio > 1.4:
-        volume_score = 68
+    # 4. Объём
+    avg_vol    = sum(volumes[-48:])/48 if len(volumes)>=48 else 1
+    recent_vol = sum(volumes[-12:])/12 if len(volumes)>=12 else 1
+    vr = recent_vol/avg_vol
+    volume_score = 82 if vr>1.9 else 68 if vr>1.4 else 50
 
-    # 5. Близость к уровню (15%)
+    # 5. Близость к уровню
     proximity_score = 50
     if levels:
-        distances = [abs(current_price - lvl) for lvl in 
-                    [levels.get("R2"), levels.get("R1"), levels.get("P"), 
-                     levels.get("S1"), levels.get("S2")]]
-        closest = min(distances) / current_price
-        if closest < 0.006:      # очень близко (<0.6%)
-            proximity_score = 78
-        elif closest < 0.012:
-            proximity_score = 62
+        dists = [abs(current_price-v) for v in
+                 [levels["R2"],levels["R1"],levels["P"],levels["S1"],levels["S2"]]]
+        cl = min(dists)/current_price
+        if cl < 0.006:   proximity_score = 78
+        elif cl < 0.012: proximity_score = 62
 
-    # 6. EMA тренд (10%)
-    ema_score = 55  # можно улучшить позже
+    bull_score = round(max(10, min(95,
+        pivot_score*0.25 + momentum_score*0.20 + rsi_score*0.15 +
+        volume_score*0.15 + proximity_score*0.15 + 55*0.10)))
 
-    # Итоговый расчёт
-    bull_score = (
-        pivot_score * 0.25 +
-        momentum_score * 0.20 +
-        rsi_score * 0.15 +
-        volume_score * 0.15 +
-        proximity_score * 0.15 +
-        ema_score * 0.10
-    )
-    bull_score = round(max(10, min(95, bull_score)))
+    if   bull_score >= 78: return bull_score, "Сильный бычий", "68-74%"
+    elif bull_score >= 68: return bull_score, "Бычий",         "60-67%"
+    elif bull_score >= 55: return bull_score, "Скорее бычий",  "53-59%"
+    elif bull_score >= 45: return bull_score, "Нейтральный",   "48-52%"
+    else:                  return bull_score, "Медвежий",       "35-47%"
 
-    # Определение sentiment
-    if bull_score >= 78:
-        sentiment = "Сильный бычий"
-        confidence = "68-74%"
-    elif bull_score >= 68:
-        sentiment = "Бычий"
-        confidence = "60-67%"
-    elif bull_score >= 55:
-        sentiment = "Скорее бычий"
-        confidence = "53-59%"
-    elif bull_score >= 45:
-        sentiment = "Нейтральный"
-        confidence = "48-52%"
-    else:
-        sentiment = "Медвежий"
-        confidence = "35-47%"
-
-    return bull_score, sentiment, confidence
-
-# ── Распознавание ключевых свечей ─────────────────────────────
+# ── Паттерны свечей ───────────────────────────────────────────
 def detect_candle_pattern(candles):
     if len(candles) < 3:
         return "none", 0
-    
-    last = candles[-1]
-    prev = candles[-2]
-    prev2 = candles[-3] if len(candles) > 2 else prev
-
-    o, h, l, c = last["o"], last["h"], last["l"], last["c"]
-    po, ph, pl, pc = prev["o"], prev["h"], prev["l"], prev["c"]
-
-    body = abs(c - o)
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
-
-    # Bullish Engulfing
-    if (o > c and po < pc and c > po and o < pc and body > (pc - po) * 0.7):
-        return "bullish_engulfing", 75
-
-    # Bearish Engulfing
-    if (o < c and po > pc and c < po and o > pc and body > (po - pc) * 0.7):
-        return "bearish_engulfing", 75
-
-    # Hammer
-    if lower_wick > body * 2 and upper_wick < body * 0.3 and c > o:
-        return "hammer", 70
-
-    # Shooting Star
-    if upper_wick > body * 2 and lower_wick < body * 0.3 and c < o:
-        return "shooting_star", 70
-
-    # Pinbar Bullish
-    if lower_wick > body * 2.5 and c > o:
-        return "pinbar_bullish", 65
-
+    last = candles[-1]; prev = candles[-2]
+    o,h,l,c   = last["o"],last["h"],last["l"],last["c"]
+    po,ph,pl,pc = prev["o"],prev["h"],prev["l"],prev["c"]
+    body  = abs(c-o)
+    uw    = h-max(o,c)
+    lw    = min(o,c)-l
+    if o>c and po<pc and c>po and o<pc and body>(pc-po)*0.7: return "bullish_engulfing",75
+    if o<c and po>pc and c<po and o>pc and body>(po-pc)*0.7: return "bearish_engulfing",75
+    if lw>body*2 and uw<body*0.3 and c>o:                    return "hammer",70
+    if uw>body*2 and lw<body*0.3 and c<o:                    return "shooting_star",70
+    if lw>body*2.5 and c>o:                                  return "pinbar_bullish",65
     return "none", 0
 
-
-# ── Конфлюэнс-анализ (Идеальные точки входа) ─────────────────
+# ── Конфлюэнс ────────────────────────────────────────────────
 def find_confluence_setup(current_price, candles, levels):
     if not candles or not levels:
         return None, None
-
-    bull_score, sentiment, _ = calculate_bull_score(current_price, candles)
-    pattern, pattern_strength = detect_candle_pattern(candles)
-    
-    book = get_order_book()
+    bull_score, _, _ = calculate_bull_score(current_price, candles)
+    pattern, pstr    = detect_candle_pattern(candles)
+    book      = get_order_book()
     bid_walls = find_walls(book["bids"], 3.5) if book else []
     ask_walls = find_walls(book["asks"], 3.5) if book else []
-
     setup = None
-    strength = 0
-
-    # Бычий сетап
-    if (bull_score >= 70 and 
-        current_price <= levels.get("S1", 99999) * 1.008 and 
-        pattern in ["hammer", "bullish_engulfing", "pinbar_bullish"]):
-        
-        strength = bull_score + pattern_strength
-        setup = {
-            "direction": "LONG",
-            "strength": strength,
-            "level": "S1/S2",
-            "reason": f"{pattern.replace('_', ' ').title()} + высокий Bull Score",
-            "score": bull_score
-        }
-
-    # Медвежий сетап
-    elif (bull_score <= 38 and 
-          current_price >= levels.get("R1", 0) * 0.992 and 
-          pattern in ["shooting_star", "bearish_engulfing"]):
-        
-        strength = (100 - bull_score) + pattern_strength
-        setup = {
-            "direction": "SHORT",
-            "strength": strength,
-            "level": "R1/R2",
-            "reason": f"{pattern.replace('_', ' ').title()} + слабый Bull Score",
-            "score": bull_score
-        }
-
-    # Дополнительно — стена в стакане
-    if setup and bid_walls and setup["direction"] == "LONG":
-        setup["reason"] += " + крупная покупательная стена"
-        setup["strength"] += 12
-    elif setup and ask_walls and setup["direction"] == "SHORT":
-        setup["reason"] += " + крупная продающая стена"
-        setup["strength"] += 12
-
+    if (bull_score>=70 and current_price<=levels.get("S1",99999)*1.008
+            and pattern in ["hammer","bullish_engulfing","pinbar_bullish"]):
+        setup = {"direction":"LONG","strength":bull_score+pstr,
+                 "level":"S1/S2","reason":f"{pattern.replace('_',' ').title()} + Bull Score {bull_score}"}
+        if bid_walls: setup["reason"] += " + стена покупки"; setup["strength"]+=12
+    elif (bull_score<=38 and current_price>=levels.get("R1",0)*0.992
+            and pattern in ["shooting_star","bearish_engulfing"]):
+        setup = {"direction":"SHORT","strength":(100-bull_score)+pstr,
+                 "level":"R1/R2","reason":f"{pattern.replace('_',' ').title()} + Bull Score {bull_score}"}
+        if ask_walls: setup["reason"] += " + стена продажи"; setup["strength"]+=12
     return setup, pattern
 
-# ── Order Book (стакан) ───────────────────────────────────────
-
+# ── Order Book ────────────────────────────────────────────────
 def get_order_book():
     try:
         r = requests.post("https://api.hyperliquid.xyz/info",
-            json={"type": "l2Book", "coin": "HYPE", "nSigFigs": 5}, timeout=10)
-        data = r.json()
+            json={"type":"l2Book","coin":"HYPE","nSigFigs":5}, timeout=10)
+        data   = r.json()
         levels = data.get("levels", [])
-        if not levels or len(levels) < 2:
+        if not levels or len(levels)<2:
             return None
-        bids = [(float(b["px"]), float(b["sz"])) for b in levels[0]]
-        asks = [(float(a["px"]), float(a["sz"])) for a in levels[1]]
-        bids.sort(key=lambda x: x[0], reverse=True)
-        asks.sort(key=lambda x: x[0])
-        print(f"[OrderBook] биды: {len(bids)}, аски: {len(asks)}")
-        return {"bids": bids, "asks": asks}
+        bids = sorted([(float(b["px"]),float(b["sz"])) for b in levels[0]],
+                      key=lambda x: x[0], reverse=True)
+        asks = sorted([(float(a["px"]),float(a["sz"])) for a in levels[1]],
+                      key=lambda x: x[0])
+        return {"bids":bids,"asks":asks}
     except Exception as e:
         print(f"[OrderBook] error: {e}")
         return None
 
 def find_walls(levels, threshold_multiplier=3.0):
-    """
-    Находит аномально крупные заявки (стены).
-    Стена = объём в N раз больше среднего.
-    """
-    if not levels:
-        return []
-    sizes = [s for _, s in levels]
-    avg = sum(sizes) / len(sizes)
-    walls = [(p, s) for p, s in levels if s >= avg * threshold_multiplier]
-    return sorted(walls, key=lambda x: x[1], reverse=True)
+    if not levels: return []
+    sizes = [s for _,s in levels]
+    avg   = sum(sizes)/len(sizes)
+    return sorted([(p,s) for p,s in levels if s>=avg*threshold_multiplier],
+                  key=lambda x: x[1], reverse=True)
 
+# ── Быстрые снимки (каждые 8 сек, макс 75) ───────────────────
 def take_fast_snapshot(book):
-    """Быстрый снимок для графика"""
-    global _fast_snapshots
-    if not book:
-        return
-    snapshot = {
-        "timestamp": time.time(),
-        "bids": {round(p, 2): s for p, s in book["bids"][:60]},
-        "asks": {round(p, 2): s for p, s in book["asks"][:60]}
-    }
-    _fast_snapshots.append(snapshot)
-    if len(_fast_snapshots) > 75:
-        _fast_snapshots.pop(0)
+    if not book: return
+    with _fast_snap_lock:
+        snap = {
+            "timestamp": time.time(),
+            "bids": {round(p,2): s for p,s in book["bids"][:60]},
+            "asks": {round(p,2): s for p,s in book["asks"][:60]},
+        }
+        _fast_snapshots.append(snap)
+        if len(_fast_snapshots) > 75:
+            _fast_snapshots.pop(0)
 
 def calculate_average_book():
-    """Средний объём по уровням"""
-    if not _fast_snapshots:
-        return None
-    bid_vol = {}
-    ask_vol = {}
-    for snap in _fast_snapshots:
-        for p, s in snap["bids"].items():
-            bid_vol[p] = bid_vol.get(p, 0) + s
-        for p, s in snap["asks"].items():
-            ask_vol[p] = ask_vol.get(p, 0) + s
-    avg_bids = {p: v / len(_fast_snapshots) for p, v in bid_vol.items()}
-    avg_asks = {p: v / len(_fast_snapshots) for p, v in ask_vol.items()}
-    return {"bids": avg_bids, "asks": avg_asks}
-
-
-def track_persistent_walls(book):
-    """Отслеживает долгоживущие стены"""
-    global _persistent_walls
-    now = time.time()
-    if not book:
-        return
-    # Очистка старых
-    for p in list(_persistent_walls.keys()):
-        if now - _persistent_walls[p]["first_seen"] > 2400:
-            del _persistent_walls[p]
-    for side, levels in [("bid", book["bids"][:40]), ("ask", book["asks"][:40])]:
-        for price, size in find_walls(levels, 3.0):
-            p = round(price, 2)
-            if p in _persistent_walls:
-                _persistent_walls[p]["size"] = max(_persistent_walls[p]["size"], size)
-                _persistent_walls[p]["last_seen"] = now
-            else:
-                _persistent_walls[p] = {
-                    "size": size,
-                    "first_seen": now,
-                    "last_seen": now,
-                    "side": side
-                }
-                
-# ── Улучшенный анализ стакана ─────────────────────────────────
-def analyze_orderbook(book):
-    if not book:
-        return None
-    
-    bids = book["bids"][:30]
-    asks = book["asks"][:30]
-    
-    # Объём на покупку и продажу
-    bid_volume = sum(s for _, s in bids)
-    ask_volume = sum(s for _, s in asks)
-    
-    # Delta
-    delta = bid_volume - ask_volume
-    delta_ratio = delta / (bid_volume + ask_volume) if (bid_volume + ask_volume) > 0 else 0
-    
-    # Imbalance (дисбаланс)
-    imbalance = None
-    if bid_volume > ask_volume * 1.8:
-        imbalance = "strong_bid"
-    elif ask_volume > bid_volume * 1.8:
-        imbalance = "strong_ask"
-    elif bid_volume > ask_volume * 1.35:
-        imbalance = "bid"
-    elif ask_volume > bid_volume * 1.35:
-        imbalance = "ask"
-    
-    # Крупные стены
-    bid_walls = find_walls(bids, 3.5)
-    ask_walls = find_walls(asks, 3.5)
-    
+    with _fast_snap_lock:
+        snaps = list(_fast_snapshots)
+    if not snaps: return None
+    bid_vol, ask_vol = {}, {}
+    for s in snaps:
+        for p,v in s["bids"].items():
+            bid_vol[p] = bid_vol.get(p,0)+v
+        for p,v in s["asks"].items():
+            ask_vol[p] = ask_vol.get(p,0)+v
+    n = len(snaps)
     return {
-        "delta": delta,
-        "delta_ratio": delta_ratio,
-        "imbalance": imbalance,
-        "bid_volume": bid_volume,
-        "ask_volume": ask_volume,
-        "bid_walls": bid_walls,
-        "ask_walls": ask_walls
+        "bids": {p: v/n for p,v in bid_vol.items()},
+        "asks": {p: v/n for p,v in ask_vol.items()},
     }
 
+# ── Долгоживущие стены (снимок каждые 30 сек, 4 часа) ────────
+def track_persistent_walls(book):
+    if not book: return
+    now = time.time()
+    with _wall_snap_lock:
+        # Удаляем старше 4 часов
+        for p in list(_persistent_walls.keys()):
+            if now - _persistent_walls[p]["first_seen"] > 14400:
+                del _persistent_walls[p]
+        for side, lvls in [("bid", book["bids"][:40]), ("ask", book["asks"][:40])]:
+            for price, size in find_walls(lvls, 3.0):
+                key = round(price, 2)
+                if key in _persistent_walls:
+                    _persistent_walls[key]["size"]      = max(_persistent_walls[key]["size"], size)
+                    _persistent_walls[key]["last_seen"] = now
+                else:
+                    _persistent_walls[key] = {
+                        "size": size, "first_seen": now,
+                        "last_seen": now, "side": side,
+                    }
 
-def get_orderbook_summary(analysis, current_price):
-    if not analysis:
-        return "Не удалось проанализировать стакан."
-    
-    text = ""
-    
-    # Delta
-    delta_sign = "🟢" if analysis["delta"] > 0 else "🔴"
-    text += f"{delta_sign} **Delta**: {analysis['delta']:,.0f} HYPE ({analysis['delta_ratio']:+.1%})\n"
-    
-    # Imbalance
-    if analysis["imbalance"] == "strong_bid":
-        text += "🟢 **Сильный дисбаланс в покупках**\n"
-    elif analysis["imbalance"] == "strong_ask":
-        text += "🔴 **Сильный дисбаланс в продажах**\n"
-    elif analysis["imbalance"] == "bid":
-        text += "🟢 Небольшой перевес покупателей\n"
-    elif analysis["imbalance"] == "ask":
-        text += "🔴 Небольшой перевес продавцов\n"
-    
-    # Стены
+# ── Анализ стакана (текст) ────────────────────────────────────
+def analyze_orderbook(book):
+    if not book: return None
+    bids = book["bids"][:30]; asks = book["asks"][:30]
+    bv = sum(s for _,s in bids); av = sum(s for _,s in asks)
+    delta = bv-av
+    dr    = delta/(bv+av) if (bv+av)>0 else 0
+    imb   = None
+    if bv>av*1.8:   imb="strong_bid"
+    elif av>bv*1.8: imb="strong_ask"
+    elif bv>av*1.35: imb="bid"
+    elif av>bv*1.35: imb="ask"
+    return {"delta":delta,"delta_ratio":dr,"imbalance":imb,
+            "bid_volume":bv,"ask_volume":av,
+            "bid_walls":find_walls(bids,3.5),"ask_walls":find_walls(asks,3.5)}
+
+def get_orderbook_summary(analysis):
+    if not analysis: return "Не удалось проанализировать стакан."
+    t  = ""
+    em = "🟢" if analysis["delta"]>0 else "🔴"
+    t += f"{em} *Delta*: {analysis['delta']:,.0f} HYPE ({analysis['delta_ratio']:+.1%})\n"
+    imb_map = {"strong_bid":"🟢 *Сильный перевес покупателей*",
+               "strong_ask":"🔴 *Сильный перевес продавцов*",
+               "bid":"🟢 Небольшой перевес покупателей",
+               "ask":"🔴 Небольшой перевес продавцов"}
+    if analysis["imbalance"]: t += imb_map[analysis["imbalance"]]+"\n"
     if analysis["bid_walls"]:
-        text += "\n🟢 **Крупные стены на покупку:**\n"
-        for p, s in analysis["bid_walls"][:2]:
-            text += f"  `${p:.2f}` — {s:,.0f} HYPE\n"
-    
+        t += "\n🟢 *Стены покупки:*\n"
+        for p,s in analysis["bid_walls"][:2]:
+            t += f"  `${p:.2f}` — {s:,.0f} HYPE\n"
     if analysis["ask_walls"]:
-        text += "\n🔴 **Крупные стены на продажу:**\n"
-        for p, s in analysis["ask_walls"][:2]:
-            text += f"  `${p:.2f}` — {s:,.0f} HYPE\n"
-    
-    return text
+        t += "\n🔴 *Стены продажи:*\n"
+        for p,s in analysis["ask_walls"][:2]:
+            t += f"  `${p:.2f}` — {s:,.0f} HYPE\n"
+    return t
 
-# ── Мониторинг стен ───────────────────────────────────────────
-_last_wall_alert: dict[int, float] = {}  # chat_id -> timestamp последнего алерта
+# ── Мониторинг стен → алерты ─────────────────────────────────
+_last_wall_alert: dict = {}
 
 def check_walls_and_notify():
-    """Проверяем стакан и шлём алерт если появилась аномальная стена"""
     book = get_order_book()
-    if not book:
-        return
-
-    now = time.time()
-    bid_walls = find_walls(book["bids"], threshold_multiplier=4.0)
-    ask_walls = find_walls(book["asks"], threshold_multiplier=4.0)
-
-    if not bid_walls and not ask_walls:
-        return
-
-    # Формируем сообщение о стенах
-    msg = "🧱 *ОБНАРУЖЕНА КРУПНАЯ ЗАЯВКА (СТЕНА)*\n\n"
+    if not book: return
+    now       = time.time()
+    bid_walls = find_walls(book["bids"], 4.0)
+    ask_walls = find_walls(book["asks"], 4.0)
+    if not bid_walls and not ask_walls: return
+    msg = "🧱 *КРУПНАЯ СТЕНА В СТАКАНЕ*\n\n"
     if ask_walls:
-        msg += "🔴 *Стены на продажу (сопротивление):*\n"
-        for price, size in ask_walls[:3]:
-            msg += f"`${price:.2f}` — {size:,.0f} HYPE\n"
+        msg += "🔴 *Продажа (сопротивление):*\n"
+        for p,s in ask_walls[:3]: msg += f"`${p:.2f}` — {s:,.0f} HYPE\n"
     if bid_walls:
-        msg += "\n🟢 *Стены на покупку (поддержка):*\n"
-        for price, size in bid_walls[:3]:
-            msg += f"`${price:.2f}` — {size:,.0f} HYPE\n"
-
+        msg += "\n🟢 *Покупка (поддержка):*\n"
+        for p,s in bid_walls[:3]: msg += f"`${p:.2f}` — {s:,.0f} HYPE\n"
     for cid in list(subscribers):
-        # Не спамим — не чаще раза в 30 минут
-        last = _last_wall_alert.get(cid, 0)
-        if now - last < 1800:
-            continue
+        if now - _last_wall_alert.get(cid,0) < 1800: continue
         try:
             bot.send_message(cid, msg)
             _last_wall_alert[cid] = now
-        except Exception:
-            pass
+        except Exception: pass
 
-# ── Тепловая карта стакана ────────────────────────────────────
+# ── Тепловая карта ────────────────────────────────────────────
 def build_heatmap(book: dict, current_price: float) -> io.BytesIO:
-    bids = book["bids"][:60]   # увеличил количество уровней
-    asks = book["asks"][:60]
-
-    BG   = '#131722'
-    TEXT = '#d1d4dc'
-    UP   = '#26a69a'
-    DOWN = '#ef5350'
-    WALL = '#f0c040'
-
-    fig, ax = plt.subplots(figsize=(11, 10), facecolor=BG)
+    bids = [(float(p), float(s)) for p,s in book["bids"][:60]]
+    asks = [(float(p), float(s)) for p,s in book["asks"][:60]]
+    BG,TEXT,UP,DOWN,WALL = '#131722','#d1d4dc','#26a69a','#ef5350','#f0c040'
+    fig, ax = plt.subplots(figsize=(11,7), facecolor=BG)
     ax.set_facecolor(BG)
     ax.tick_params(colors=TEXT, labelsize=9)
-    for s in ax.spines.values():
-        s.set_color('#2a2e39')
-
-    all_sizes = [s for _, s in bids + asks]
-    avg_size  = sum(all_sizes) / len(all_sizes) if all_sizes else 1
+    for sp in ax.spines.values(): sp.set_color('#2a2e39')
+    all_sizes = [s for _,s in bids+asks]
+    avg_size  = sum(all_sizes)/len(all_sizes) if all_sizes else 1
     max_size  = max(all_sizes) if all_sizes else 1
-
-    # Увеличенный диапазон — теперь ±0.8% (можно регулировать)
-    price_range = current_price * 0.008   # ← было 0.002, стало 0.008
-
-    for p, s in asks:
-        color = WALL if s >= avg_size * 3 else DOWN
-        ax.barh(p, s, height=current_price*0.0004, color=color, alpha=0.85, zorder=3)
-
-    for p, s in bids:
-        color = WALL if s >= avg_size * 3 else UP
-        ax.barh(p, s, height=current_price*0.0004, color=color, alpha=0.85, zorder=3)
-
-    # Линия текущей цены
-    ax.axhline(current_price, color='#f0c040', linewidth=1.8,
-               linestyle='--', zorder=5)
-    ax.text(max_size * 0.95, current_price + current_price*0.0005,
+    bar_h     = current_price * 0.0004
+    for p,s in asks:
+        ax.barh(p, s, height=bar_h,
+                color=WALL if s>=avg_size*3 else DOWN, alpha=0.85, zorder=3)
+    for p,s in bids:
+        ax.barh(p, s, height=bar_h,
+                color=WALL if s>=avg_size*3 else UP, alpha=0.85, zorder=3)
+    ax.axhline(current_price, color=WALL, linewidth=1.8, linestyle='--', zorder=5)
+    ax.text(max_size*0.95, current_price+current_price*0.0005,
             f' ${current_price:.2f} ← Текущая',
-            color='#f0c040', fontsize=11, va='bottom', fontweight='bold')
-
-    ax.set_ylim(current_price - price_range, current_price + price_range)
-    ax.set_xlim(0, max_size * 1.18)
-
+            color=WALL, fontsize=11, va='bottom', fontweight='bold')
+    price_range = current_price*0.008
+    ax.set_ylim(current_price-price_range, current_price+price_range)
+    ax.set_xlim(0, max_size*1.18)
     ax.yaxis.grid(True, color='#1e2638', linewidth=0.5, zorder=0)
     ax.set_xlabel('Объём (HYPE)', color=TEXT, fontsize=10)
-    ax.set_ylabel('Цена ($)', color=TEXT, fontsize=10)
-    ax.set_title(
-        f'📖 Стакан заявок HYPE  •  диапазон ±0.8% от цены\n'
-        f'🟢 Покупки    🔴 Продажи    🟡 Крупная стена (3x среднего)',
-        color=TEXT, fontsize=11, loc='left', pad=10)
-
-    # Подписи топ-стен
-    all_levels = [(p, s) for p, s in bids + asks]
-    top5 = sorted(all_levels, key=lambda x: x[1], reverse=True)[:6]
-    for price, size in top5:
-        ax.annotate(f'{size:,.0f}',
-                    xy=(size, price),
-                    xytext=(6, 0), textcoords='offset points',
-                    color=TEXT, fontsize=8, va='center', fontweight='bold')
-
-    plt.tight_layout(pad=1.2)
+    ax.set_ylabel('Цена ($)',     color=TEXT, fontsize=10)
+    ax.set_title('📖 Стакан заявок HYPE  •  усреднено по 75 снимкам\n'
+                 '🟢 Покупки    🔴 Продажи    🟡 Крупная стена (3x среднего)',
+                 color=TEXT, fontsize=10, loc='left', pad=8)
+    all_lvls = bids+asks
+    for p,s in sorted(all_lvls, key=lambda x: x[1], reverse=True)[:5]:
+        ax.annotate(f'{s:,.0f}', xy=(s,p), xytext=(5,0),
+                    textcoords='offset points', color=TEXT, fontsize=8, va='center')
+    plt.tight_layout(pad=1.0)
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=135, facecolor=BG)
-    plt.close(fig)
-    buf.seek(0)
+    fig.savefig(buf, format='png', dpi=130, facecolor=BG)
+    plt.close(fig); buf.seek(0)
     return buf
 
 # ── График свечей ─────────────────────────────────────────────
 def build_chart(candles, price):
-    o=[c['o'] for c in candles]; h=[c['h'] for c in candles]
-    l=[c['l'] for c in candles]; cl=[c['c'] for c in candles]
-    v=[c['v'] for c in candles]
-    t=[datetime.fromtimestamp(c['t']/1000, tz=timezone.utc) for c in candles]
+    o =[c['o'] for c in candles]; h=[c['h'] for c in candles]
+    l =[c['l'] for c in candles]; cl=[c['c'] for c in candles]
+    v =[c['v'] for c in candles]
+    t =[datetime.fromtimestamp(c['t']/1000, tz=timezone.utc) for c in candles]
     n = len(candles)
+    # Цена из последней свечи — совпадает с графиком
+    chart_price = cl[-1]
     BG,GRID,UP,DOWN,TEXT,PL = '#131722','#1e2638','#26a69a','#ef5350','#d1d4dc','#f0c040'
     fig = plt.figure(figsize=(12,7), facecolor=BG)
-    ax  = fig.add_axes([0.02, 0.18, 0.84, 0.72], facecolor=BG)
-    av  = fig.add_axes([0.02, 0.05, 0.84, 0.11], facecolor=BG)
-    for a in (ax, av):
+    ax  = fig.add_axes([0.02,0.18,0.84,0.72], facecolor=BG)
+    av  = fig.add_axes([0.02,0.05,0.84,0.11], facecolor=BG)
+    for a in (ax,av):
         a.tick_params(colors=TEXT, labelsize=8)
-        for s in a.spines.values():
-            s.set_color(GRID)
+        for sp in a.spines.values(): sp.set_color(GRID)
     for i,(oi,hi,li,ci,vi) in enumerate(zip(o,h,l,cl,v)):
         col = UP if ci>=oi else DOWN
         ax.add_patch(Rectangle((i-.3,min(oi,ci)),.6,max(abs(ci-oi),.001),color=col,zorder=3))
-        ax.plot([i,i],[li,min(oi,ci)],color=col,linewidth=1,zorder=2)
-        ax.plot([i,i],[max(oi,ci),hi],color=col,linewidth=1,zorder=2)
+        ax.plot([i,i],[li,min(oi,ci)], color=col, linewidth=1, zorder=2)
+        ax.plot([i,i],[max(oi,ci),hi], color=col, linewidth=1, zorder=2)
         av.add_patch(Rectangle((i-.3,0),.6,vi,
-                     color='#1a4a47' if ci>=oi else '#4a1a1a',zorder=2))
+                     color='#1a4a47' if ci>=oi else '#4a1a1a', zorder=2))
     levels = get_pivot_levels()
     if levels:
-        pp_pad = (max(h) - min(l)) * 0.05
-        ymin = min(l) - pp_pad
-        ymax = max(h) + pp_pad
+        pp_pad = (max(h)-min(l))*0.05
+        ymin,ymax = min(l)-pp_pad, max(h)+pp_pad
         def draw_level(val, color, label, ls='--', lw=0.8):
-            if ymin <= val <= ymax:
+            if ymin<=val<=ymax:
                 ax.axhline(val, color=color, linewidth=lw, linestyle=ls, zorder=3, alpha=0.8)
                 ax.text(n+0.5, val, label, color=color, fontsize=7.5, va='center',
                         bbox=dict(boxstyle='round,pad=0.2', facecolor='#131722',
                                   edgecolor=color, alpha=0.85))
-        draw_level(levels["R2"], '#ff4444', 'R2', lw=1.0)
-        draw_level(levels["R1"], '#ff8888', 'R1')
-        draw_level(levels["P"],  '#ffffff', ' P ', ls='-', lw=1.0)
-        draw_level(levels["S1"], '#88cc88', 'S1')
-        draw_level(levels["S2"], '#44aa44', 'S2', lw=1.0)
-        draw_level(levels["local_high"], '#ffaa00', 'LH', ls=':', lw=1.1)
-        draw_level(levels["local_low"],  '#00aaff', 'LL', ls=':', lw=1.1)
-    ax.axhline(price, color=PL, linewidth=1, linestyle='--', zorder=4)
-    ax.text(n+0.8, price, f'${price:.4f}', color='#131722', fontsize=11,
+        draw_level(levels["R2"],'#ff4444','R2',lw=1.0)
+        draw_level(levels["R1"],'#ff8888','R1')
+        draw_level(levels["P"], '#ffffff',' P ',ls='-',lw=1.0)
+        draw_level(levels["S1"],'#88cc88','S1')
+        draw_level(levels["S2"],'#44aa44','S2',lw=1.0)
+        draw_level(levels["local_high"],'#ffaa00','LH',ls=':',lw=1.1)
+        draw_level(levels["local_low"], '#00aaff','LL',ls=':',lw=1.1)
+    # Линия цены из последней свечи
+    ax.axhline(chart_price, color=PL, linewidth=1, linestyle='--', zorder=4)
+    ax.text(n+0.8, chart_price, f'${chart_price:.4f}', color='#131722', fontsize=11,
             va='center', fontweight='bold',
             bbox=dict(boxstyle='round,pad=0.4', facecolor=PL, edgecolor='none'))
     ax.yaxis.grid(True, color=GRID, linewidth=0.5, zorder=0)
     av.yaxis.grid(True, color=GRID, linewidth=0.5, zorder=0)
     step = max(1, n//8)
-    xt = list(range(0, n, step))
+    xt   = list(range(0,n,step))
     ax.set_xticks([])
     av.set_xticks(xt)
     av.set_xticklabels([t[i].strftime('%H:%M') for i in xt], color=TEXT, fontsize=7)
-    pp_pad = (max(h) - min(l)) * 0.05
-    ax.set_xlim(-1, n+3); ax.set_ylim(min(l)-pp_pad, max(h)+pp_pad)
-    av.set_xlim(-1, n+3); av.set_ylim(0, max(v)*1.3)
+    pp_pad = (max(h)-min(l))*0.05
+    ax.set_xlim(-1,n+3); ax.set_ylim(min(l)-pp_pad, max(h)+pp_pad)
+    av.set_xlim(-1,n+3); av.set_ylim(0, max(v)*1.3)
     ax.yaxis.set_label_position('right'); ax.yaxis.tick_right()
     av.yaxis.set_label_position('right'); av.yaxis.tick_right()
     chg = (cl[-1]-o[0])/o[0]*100
@@ -747,62 +554,47 @@ def cmd_price(message):
     if not data:
         bot.send_message(message.chat.id, "⏳ Загружаю данные...")
         return
-
     em = trend_emoji(data["change_24h"])
-    s = "+" if data["change_24h"] >= 0 else ""
-
+    s  = "+" if data["change_24h"]>=0 else ""
     candles = get_candles(6)
-    levels = get_pivot_levels()
-
-    bull_score = 50
-    sentiment = "Нейтральный"
-    confidence = "50%"
+    levels  = get_pivot_levels()
+    bull_score, sentiment, confidence = 50, "Нейтральный", "50%"
     setup_text = ""
-
-    if candles and len(candles) > 25:
+    if candles and len(candles)>25:
         bull_score, sentiment, confidence = calculate_bull_score(data["price"], candles)
-        
-        setup, pattern = find_confluence_setup(data["price"], candles, levels)
-        if setup and setup["strength"] >= 75:
-            setup_text = (
-                f"\n\n🔥 *ИДЕАЛЬНАЯ ТОЧКА ВХОДА*\n"
-                f"**{setup['direction']}** — Сила: {setup['strength']}/100\n"
-                f"Уровень: {setup['level']}\n"
-                f"Причина: {setup['reason']}"
-            )
-
-    # Основной текст
+        setup, _ = find_confluence_setup(data["price"], candles, levels)
+        if setup and setup["strength"]>=75:
+            setup_text = (f"\n\n🔥 *ТОЧКА ВХОДА*\n"
+                          f"*{setup['direction']}* — Сила: {setup['strength']}/100\n"
+                          f"Уровень: {setup['level']}\n"
+                          f"Причина: {setup['reason']}")
     levels_text = ""
     if levels:
-        levels_text = f"\n\n📊 *Уровни:*\nR2: `${levels['R2']:.2f}` | R1: `${levels['R1']:.2f}`\nP: `${levels['P']:.2f}` | S1: `${levels['S1']:.2f}`"
-
-    forecast = f"\n\n🔮 *Прогноз 1-4ч*: **{sentiment}** (Bull Score: {bull_score}/100)"
-
-    caption = (f"💰 *HYPE / USD*\n\n"
-               f"Цена: `${data['price']:.4f}`\n"
-               f"Изм.24ч: {em} `{s}{data['change_24h']:.2f}%`\n"
-               f"{forecast}"
-               f"{levels_text}"
-               f"{setup_text}")
-
+        levels_text = (f"\n\n📊 *Уровни:*\n"
+                       f"R2:`${levels['R2']:.2f}` R1:`${levels['R1']:.2f}`\n"
+                       f"P:`${levels['P']:.2f}` S1:`${levels['S1']:.2f}`")
+    forecast = f"\n\n🔮 *Прогноз 1-4ч*: *{sentiment}* (Bull Score: {bull_score}/100)"
+    caption  = (f"💰 *HYPE / USD*\n\n"
+                f"Цена: `${data['price']:.4f}`\n"
+                f"Изм.24ч: {em} `{s}{data['change_24h']:.2f}%`"
+                f"{forecast}{levels_text}{setup_text}")
     if candles:
         try:
-            bot.send_photo(message.chat.id, build_chart(candles, data["price"]),
+            bot.send_photo(message.chat.id,
+                           build_chart(candles, data["price"]),
                            caption=caption, parse_mode="Markdown")
             return
         except Exception as e:
             print(f"[Chart] error: {e}")
-
     bot.send_message(message.chat.id, caption, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "📊 Статистика 24ч")
 def cmd_stats(message):
     data = get_cached()
     if not data:
-        bot.send_message(message.chat.id, "⏳ Загружаю данные, подожди ~10 сек...")
-        return
-    s7  = "+" if data["change_7d"]  >= 0 else ""
-    s24 = "+" if data["change_24h"] >= 0 else ""
+        bot.send_message(message.chat.id, "⏳ Загружаю данные..."); return
+    s7  = "+" if data["change_7d"] >=0 else ""
+    s24 = "+" if data["change_24h"]>=0 else ""
     bot.send_message(message.chat.id,
         f"📊 *Статистика HYPE*\n\n"
         f"Объём 24ч:       `${data['volume']:,.0f}`\n"
@@ -814,46 +606,48 @@ def cmd_stats(message):
 def cmd_orderbook(message):
     data = get_cached()
     if not data:
-        bot.send_message(message.chat.id, "⏳ Загружаю...")
-        return
-
+        bot.send_message(message.chat.id, "⏳ Загружаю..."); return
     bot.send_message(message.chat.id, "⏳ Анализирую стакан...")
-
     book = get_order_book()
     if not book:
-        bot.send_message(message.chat.id, "❌ Не удалось получить стакан.")
-        return
+        bot.send_message(message.chat.id, "❌ Не удалось получить стакан."); return
 
-    take_fast_snapshot(book)
-    track_persistent_walls(book)
+    best_ask = book["asks"][0][0] if book["asks"] else None
+    best_bid = book["bids"][0][0] if book["bids"] else None
+    mid_price = (best_ask+best_bid)/2 if best_ask and best_bid else data["price"]
 
     analysis = analyze_orderbook(book)
-    mid_price = (book["asks"][0][0] + book["bids"][0][0]) / 2 if book["asks"] and book["bids"] else data["price"]
-
-    text = f"📖 *Стакан заявок HYPE*\n_Цена ≈ ${mid_price:.4f}_\n\n"
-    text += get_orderbook_summary(analysis, mid_price)
+    text  = f"📖 *Стакан заявок HYPE*\n_Цена ≈ ${mid_price:.4f}_\n\n"
+    text += get_orderbook_summary(analysis)
 
     # Долгоживущие стены
     now = time.time()
+    with _wall_snap_lock:
+        walls_copy = dict(_persistent_walls)
     persistent = []
-    for price, info in sorted(_persistent_walls.items(), key=lambda x: x[1]["first_seen"]):
-        duration = int((now - info["first_seen"]) / 60)
-        if duration >= 5:
-            emoji = "🟢" if info["side"] == "bid" else "🔴"
-            persistent.append(f"{emoji} `${price:.2f}` — {info['size']:,.0f} HYPE ({duration} мин)")
-
+    for price, info in sorted(walls_copy.items(), key=lambda x: x[1]["first_seen"]):
+        dur = int((now-info["first_seen"])/60)
+        if dur >= 5:
+            em = "🟢" if info["side"]=="bid" else "🔴"
+            persistent.append(f"{em} `${price:.2f}` — {info['size']:,.0f} HYPE ({dur} мин)")
     if persistent:
         text += f"\n\n🕒 *Устойчивые стены (≥5 мин):*\n" + "\n".join(persistent[:8])
 
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
-    # График
+    # Тепловая карта из усреднённого стакана
     try:
-        avg_book = calculate_average_book()
-        if avg_book:
-            fake_book = {"bids": list(avg_book["bids"].items()), "asks": list(avg_book["asks"].items())}
-            heatmap = build_heatmap(fake_book, mid_price)
-            bot.send_photo(message.chat.id, heatmap, caption="🌡 *Усреднённая тепловая карта (75 снимков)*", parse_mode="Markdown")
+        avg = calculate_average_book()
+        if avg and avg["bids"] and avg["asks"]:
+            avg_bids = sorted(avg["bids"].items(), key=lambda x: x[0], reverse=True)
+            avg_asks = sorted(avg["asks"].items(), key=lambda x: x[0])
+            heatmap  = build_heatmap({"bids":avg_bids,"asks":avg_asks}, mid_price)
+            bot.send_photo(message.chat.id, heatmap,
+                           caption=f"🌡 *Тепловая карта* (усреднено по {len(_fast_snapshots)} снимкам)",
+                           parse_mode="Markdown")
+        else:
+            bot.send_message(message.chat.id,
+                "⏳ Снимки стакана ещё накапливаются (~2 мин). Попробуй чуть позже.")
     except Exception as e:
         print(f"[Heatmap] error: {e}")
 
@@ -863,35 +657,49 @@ def cmd_notify(message):
     if cid in subscribers:
         bot.send_message(cid,
             "✅ Уведомления уже включены!\n\n"
-            "Получишь сигнал если:\n"
             "• HYPE изменится на *1%+* за 15 минут\n"
-            "• В стакане появится крупная стена\n\n"
-            "Чтобы отключить — нажми ❌ Отписаться",
-            parse_mode="Markdown")
+            "• Появится крупная стена в стакане\n\n"
+            "Отключить — ❌ Отписаться", parse_mode="Markdown")
     else:
         subscribers.add(cid)
         data = get_cached()
-        if data:
-            sub_base[cid] = data["price"]
+        if data: sub_base[cid] = data["price"]
         save_subscribers()
-        msg = (
-            f"✅ *Уведомления включены!*\n\n"
-            f"Получишь сигнал если:\n"
-            f"• HYPE изменится на *1%+* за 15 минут\n"
-            f"• В стакане появится крупная стена 🧱\n"
-        )
-        if data:
-            msg += f"\nТекущая цена: `${data['price']:.4f}`"
+        msg = ("✅ *Уведомления включены!*\n\n"
+               "Пришлю сигнал если:\n"
+               "• HYPE изменится на *1%+* за 15 минут\n"
+               "• Появится крупная стена 🧱\n")
+        if data: msg += f"\nТекущая цена: `${data['price']:.4f}`"
         bot.send_message(cid, msg, parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: m.text == "🐂 Bull Score 60+")
+def cmd_bull_notify(message):
+    cid = message.chat.id
+    if cid in bull_subscribers:
+        bot.send_message(cid,
+            "✅ Bull Score уведомления уже включены!\n\n"
+            "Пришлю сигнал когда Bull Score превысит *60*.\n\n"
+            "Отключить — ❌ Отписаться", parse_mode="Markdown")
+    else:
+        bull_subscribers.add(cid)
+        save_subscribers()
+        bot.send_message(cid,
+            "✅ *Bull Score уведомления включены!*\n\n"
+            "Пришлю сигнал когда Bull Score HYPE превысит *60/100* — "
+            "это означает что рынок склоняется к росту.",
+            parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "❌ Отписаться")
 def cmd_unsub(message):
     cid = message.chat.id
+    removed = False
     if cid in subscribers:
-        subscribers.discard(cid)
-        sub_base.pop(cid, None)
+        subscribers.discard(cid); sub_base.pop(cid,None); removed = True
+    if cid in bull_subscribers:
+        bull_subscribers.discard(cid); removed = True
+    if removed:
         save_subscribers()
-        bot.send_message(cid, "✅ Уведомления отключены.")
+        bot.send_message(cid, "✅ Все уведомления отключены.")
     else:
         bot.send_message(cid, "ℹ️ У тебя не было активных уведомлений.")
 
@@ -899,30 +707,52 @@ def cmd_unsub(message):
 def cmd_help(message):
     bot.send_message(message.chat.id,
         "📖 *Как пользоваться ботом*\n\n"
-        "💰 *Курс HYPE* — цена + график 5м за 6 часов + уровни\n"
+        "💰 *Курс HYPE* — цена + график 5м за 6ч + уровни + прогноз\n"
         "📊 *Статистика 24ч* — объём, капитализация\n"
-        "📖 *Стакан заявок* — топ-5 покупок/продаж + тепловая карта\n"
+        "📖 *Стакан заявок* — анализ + тепловая карта (75 снимков)\n"
         "🔔 *Уведомления 1%* — сигнал при движении 1%+ за 15 мин\n"
-        "   + алерт при появлении крупной стены в стакане\n"
-        "❌ *Отписаться* — выключить уведомления\n\n"
-        "📊 *Расшифровка уровней:*\n"
-        "R2/R1 — сопротивления (цена тормозит при росте)\n"
-        "P — центральный пивот (среднее за 3 дня)\n"
-        "S1/S2 — поддержки (цена тормозит при падении)\n"
-        "LH/LL — локальные макс/мин последних 2 дней\n"
+        "🐂 *Bull Score 60+* — сигнал когда рынок склоняется к росту\n"
+        "❌ *Отписаться* — выключить все уведомления\n\n"
+        "📊 *Уровни:*\n"
+        "R2/R1 — сопротивления | S1/S2 — поддержки\n"
+        "P — центральный пивот | LH/LL — локальные экстремумы\n"
         "🧱 — крупная стена в стакане\n\n"
-        "_Данные обновляются раз в минуту_")
+        "_Данные: цена раз в минуту, стакан каждые 8-30 сек_")
 
 @bot.message_handler(func=lambda m: True)
 def fallback(message):
     bot.send_message(message.chat.id, "🤔 Воспользуйся кнопками ниже.",
                      reply_markup=main_markup())
 
-# ── Монитор ───────────────────────────────────────────────────
-_wall_check_counter = 0
+# ── Фоновый поток: быстрые снимки стакана (каждые 8 сек) ─────
+def fast_snapshot_loop():
+    print("[FastSnap] Запуск потока снимков стакана...")
+    while True:
+        try:
+            book = get_order_book()
+            if book:
+                take_fast_snapshot(book)
+        except Exception as e:
+            print(f"[FastSnap] error: {e}")
+        time.sleep(8)
+
+# ── Фоновый поток: долгие стены (каждые 30 сек) ──────────────
+def wall_track_loop():
+    print("[WallTrack] Запуск потока отслеживания стен...")
+    while True:
+        try:
+            book = get_order_book()
+            if book:
+                track_persistent_walls(book)
+        except Exception as e:
+            print(f"[WallTrack] error: {e}")
+        time.sleep(30)
+
+# ── Основной монитор цены (каждую минуту) ─────────────────────
+_last_bull_alert: dict = {}
 
 def price_monitor():
-    global _latest, _price_history, _wall_check_counter
+    global _latest, _price_history
     print("[Monitor] Запуск...")
     data = _fetch_hype()
     if data:
@@ -930,69 +760,75 @@ def price_monitor():
             _latest = data
         print(f"[Monitor] Кэш: ${data['price']:.4f}")
 
+    wall_counter = 0
     while True:
         time.sleep(60)
         data = _fetch_hype()
-        if not data:
-            continue
-
+        if not data: continue
         now = time.time()
         with _cache_lock:
             _latest = data
             _price_history.append((data["price"], now))
-            _price_history = [(p, t) for p, t in _price_history if now - t <= 1200]
+            _price_history = [(p,t) for p,t in _price_history if now-t<=1200]
             snap = list(_price_history)
 
-        # Проверка изменения цены за 15 минут
+        # Алерт изменения цены 1% за 15 мин
         for cid in list(subscribers):
-            old_prices = [p for p, t in snap if 840 <= now - t <= 960]
-            base = old_prices[0] if old_prices else sub_base.get(cid, 0)
-            if base > 0:
-                chg = (data["price"] - base) / base * 100
-                if abs(chg) >= 1.0:
-                    d = "вырос 🚀" if chg > 0 else "упал 🔻"
+            old = [p for p,t in snap if 840<=now-t<=960]
+            base = old[0] if old else sub_base.get(cid,0)
+            if base>0:
+                chg = (data["price"]-base)/base*100
+                if abs(chg)>=1.0:
+                    d = "вырос 🚀" if chg>0 else "упал 🔻"
                     try:
                         bot.send_message(cid,
                             f"⚡ *СИГНАЛ: HYPE {d}*\n\n"
-                            f"Изменение за 15 мин: `{chg:+.2f}%`\n"
-                            f"Цена сейчас: `${data['price']:.4f}`\n"
-                            f"Было 15 мин назад: `${base:.4f}`")
+                            f"За 15 мин: `{chg:+.2f}%`\n"
+                            f"Сейчас: `${data['price']:.4f}`\n"
+                            f"Было:   `${base:.4f}`")
                         sub_base[cid] = data["price"]
                         save_subscribers()
                     except Exception:
-                        subscribers.discard(cid)
-                        sub_base.pop(cid, None)
-                        save_subscribers()
+                        subscribers.discard(cid); sub_base.pop(cid,None); save_subscribers()
 
-        # Автоматический трекинг стакана
-        _wall_check_counter += 1
-        if _wall_check_counter % 2 == 0:   # каждые ~2 минуты
-            try:
-                book = get_order_book()
-                if book:
-                    take_fast_snapshot(book)
-                    track_persistent_walls(book)
-            except:
-                pass
+        # Алерт Bull Score 60+
+        if bull_subscribers:
+            candles = get_candles(6)
+            if candles and len(candles)>25:
+                bull_score, sentiment, _ = calculate_bull_score(data["price"], candles)
+                if bull_score >= 60:
+                    for cid in list(bull_subscribers):
+                        if now - _last_bull_alert.get(cid,0) < 3600: continue
+                        try:
+                            bot.send_message(cid,
+                                f"🐂 *Bull Score {bull_score}/100*\n\n"
+                                f"Настроение: *{sentiment}*\n"
+                                f"Цена HYPE: `${data['price']:.4f}`\n\n"
+                                f"_Рынок склоняется к росту_")
+                            _last_bull_alert[cid] = now
+                        except Exception:
+                            bull_subscribers.discard(cid); save_subscribers()
 
-        # Проверка стен — каждые 5 минут
-        if _wall_check_counter >= 5 and subscribers:
-            _wall_check_counter = 0
-            try:
-                check_walls_and_notify()
-            except Exception as e:
-                print(f"[Walls] error: {e}")
+        # Алерт стен раз в 5 минут
+        wall_counter += 1
+        if wall_counter >= 5 and subscribers:
+            wall_counter = 0
+            try: check_walls_and_notify()
+            except Exception as e: print(f"[Walls] error: {e}")
 
+# ── Запуск потоков ────────────────────────────────────────────
 load_subscribers()
-threading.Thread(target=price_monitor, daemon=True).start()
+threading.Thread(target=fast_snapshot_loop, daemon=True).start()
+threading.Thread(target=wall_track_loop,    daemon=True).start()
+threading.Thread(target=price_monitor,      daemon=True).start()
 
-# ── Запуск ────────────────────────────────────────────────────
+# ── Запуск Flask / polling ────────────────────────────────────
 print("✅ Бот запущен...")
 if DOMAIN:
     webhook_url = f"https://{DOMAIN}/{TOKEN}"
     bot.remove_webhook()
     time.sleep(1)
-    bot.set_webhook(url=webhook_url, allowed_updates=["message", "callback_query"])
+    bot.set_webhook(url=webhook_url, allowed_updates=["message","callback_query"])
     print(f"[Webhook] установлен: {webhook_url}")
     app.run(host="0.0.0.0", port=PORT)
 else:
