@@ -113,10 +113,17 @@ def main_markup():
 # ── CoinGecko ─────────────────────────────────────────────────
 def _fetch_hype():
     try:
+        # Пробуем новый ID
         r = requests.get(
-            "https://api.coingecko.com/api/v3/coins/hyperliquid",
+            "https://api.coingecko.com/api/v3/coins/hyperliquid-hype", 
             timeout=10
         )
+        if r.status_code == 404:
+            # Альтернативный вариант
+            r = requests.get(
+                "https://api.coingecko.com/api/v3/coins/hyperliquid", 
+                timeout=10
+            )
         r.raise_for_status()
         d = r.json()["market_data"]
         return {
