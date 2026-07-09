@@ -438,22 +438,6 @@ def find_walls(levels, threshold_multiplier=3.0):
     return sorted(walls, key=lambda x: x[1], reverse=True)
 
 def take_fast_snapshot(book):
-    """Быстрый снимок для графика (каждые 8 сек)"""
-    global _fast_snapshots
-    if not book:
-        return
-    
-    snapshot = {
-        "timestamp": time.time(),
-        "bids": {round(p, 2): s for p, s in book["bids"][:60]},
-        "asks": {round(p, 2): s for p, s in book["asks"][:60]}
-    }
-    
-    _fast_snapshots.append(snapshot)
-    if len(_fast_snapshots) > 75:
-        _fast_snapshots.pop(0)
-
-def take_fast_snapshot(book):
     """Быстрый снимок для графика"""
     global _fast_snapshots
     if not book:
@@ -466,7 +450,6 @@ def take_fast_snapshot(book):
     _fast_snapshots.append(snapshot)
     if len(_fast_snapshots) > 75:
         _fast_snapshots.pop(0)
-
 
 def calculate_average_book():
     """Средний объём по уровням"""
@@ -494,54 +477,6 @@ def track_persistent_walls(book):
     for p in list(_persistent_walls.keys()):
         if now - _persistent_walls[p]["first_seen"] > 2400:
             del _persistent_walls[p]
-    for side, levels in [("bid", book["bids"][:40]), ("ask", book["asks"][:40])]:
-        for price, size in find_walls(levels, 3.0):
-            p = round(price, 2)
-            if p in _persistent_walls:
-                _persistent_walls[p]["size"] = max(_persistent_walls[p]["size"], size)
-                _persistent_walls[p]["last_seen"] = now
-            else:
-                _persistent_walls[p] = {
-                    "size": size,
-                    "first_seen": now,
-                    "last_seen": now,
-                    "side": side
-                }
-
-def calculate_average_book():
-    """Считает средний объём по уровням за последние снимки"""
-    if not _fast_snapshots:
-        return None
-    
-    bid_vol = {}
-    ask_vol = {}
-    
-    for snap in _fast_snapshots:
-        for p, s in snap["bids"].items():
-            bid_vol[p] = bid_vol.get(p, 0) + s
-        for p, s in snap["asks"].items():
-            ask_vol[p] = ask_vol.get(p, 0) + s
-    
-    # Среднее
-    avg_bids = {p: v / len(_fast_snapshots) for p, v in bid_vol.items()}
-    avg_asks = {p: v / len(_fast_snapshots) for p, v in ask_vol.items()}
-    
-    return {"bids": avg_bids, "asks": avg_asks}
-
-
-def track_persistent_walls(book):
-    """Отслеживает долгоживущие стены"""
-    global _persistent_walls
-    now = time.time()
-    
-    if not book:
-        return
-    
-    # Очищаем старые (> 40 минут)
-    for p in list(_persistent_walls.keys()):
-        if now - _persistent_walls[p]["first_seen"] > 2400:
-            del _persistent_walls[p]
-    
     for side, levels in [("bid", book["bids"][:40]), ("ask", book["asks"][:40])]:
         for price, size in find_walls(levels, 3.0):
             p = round(price, 2)
