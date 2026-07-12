@@ -12,6 +12,7 @@ import json
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 from matplotlib.patches import Rectangle
 from datetime import datetime, timezone
 from telebot import types
@@ -77,9 +78,9 @@ _persistent_walls = {}
 _wall_snap_lock   = threading.Lock()
 
 # ── Глубокий стакан (каждые 15 сек, 3 часа = 720 снимков) ───
-_deep_snapshots = []        # макс 720 снимков
+_deep_snapshots = []
 _deep_snap_lock = threading.Lock()
-DEEP_MAX_SNAPS  = 720       # 15 сек * 720 = 3 часа
+DEEP_MAX_SNAPS  = 720
 
 def get_cached():
     with _cache_lock:
@@ -208,6 +209,114 @@ def calculate_rsi(prices, period=14):
     al = sum(losses[-period:])/period or 0.0001
     return 100-(100/(1+ag/al))
 
+# ── EMA ───────────────────────────────────────────────────────
+def calculate_ema(prices, period):
+    """Возвращает список EMA той же длины что и prices (начало — None)"""
+    if len(prices) < period:
+        return [None]*len(prices)
+    k   = 2/(period+1)
+    ema = [None]*(period-1)
+    ema.append(sum(prices[:period])/period)
+    for p in prices[period:]:
+        ema.append(p*k + ema[-1]*(1-k))
+    return ema
+
+# ── RSI серия (для графика) ───────────────────────────────────
+def calculate_rsi_series(prices, period=14):
+    """Возвращает список RSI той же длины что и prices"""
+    result = [None]*period
+    for i in range(period, len(prices)):
+        result.append(calculate_rsi(prices[max(0,i-28):i+1]))
+    return result
+
+# ── Дивергенция RSI ───────────────────────────────────────────
+def detect_rsi_divergence(candles):
+    """
+    Бычья: цена делает новый минимум, RSI — нет → разворот вверх.
+    Медвежья: цена делает новый максимум, RSI — нет → разворот вниз.
+    Возвращает: 'bullish', 'bearish' или None
+    """
+    if len(candles) < 20:
+        return None
+    closes = [c["c"] for c in candles]
+    rsi_vals = []
+    for i in range(14, len(closes)):
+        rsi_vals.append(calculate_rsi(closes[max(0,i-28):i+1]))
+    if len(rsi_vals) < 8:
+        return None
+
+    # Сравниваем первую и вторую половины последних 10 точек
+    rc = closes[-10:]; rr = rsi_vals[-10:]
+    p_lo1 = min(rc[:5]); p_lo2 = min(rc[5:])
+    p_hi1 = max(rc[:5]); p_hi2 = max(rc[5:])
+    r_lo1 = min(rr[:5]); r_lo2 = min(rr[5:])
+    r_hi1 = max(rr[:5]); r_hi2 = max(rr[5:])
+
+    if p_lo2 < p_lo1*0.998 and r_lo2 > r_lo1*1.01:
+        return "bullish"
+    if p_hi2 > p_hi1*1.002 and r_hi2 < r_hi1*0.99:
+        return "bearish"
+    return None
+
+# ── Volume Profile ────────────────────────────────────────────
+def calculate_volume_profile(candles, bins=20):
+    """
+    Считает объём по ценовым уровням (volume profile).
+    Возвращает список (price_level, volume) отсортированный по цене.
+    """
+    if not candles: return []
+    highs  = [c["h"] for c in candles]
+    lows   = [c["l"] for c in candles]
+    vols   = [c["v"] for c in candles]
+    closes = [c["c"] for c in candles]
+
+    price_min = min(lows)
+    price_max = max(highs)
+    if price_max == price_min: return []
+
+    step = (price_max - price_min) / bins
+    profile = [0.0]*bins
+
+    for i, c in enumerate(candles):
+        # Распределяем объём свечи равномерно по её диапазону
+        lo, hi, v = c["l"], c["h"], c["v"]
+        candle_range = hi - lo if hi > lo else step
+        for b in range(bins):
+            level_lo = price_min + b*step
+            level_hi = level_lo + step
+            overlap  = max(0, min(hi, level_hi) - max(lo, level_lo))
+            profile[b] += v * (overlap / candle_range)
+
+    result = []
+    for b in range(bins):
+        price_mid = price_min + (b+0.5)*step
+        result.append((price_mid, profile[b]))
+    return result
+
+def get_poc(volume_profile):
+    """Point of Control — уровень с максимальным объёмом"""
+    if not volume_profile: return None
+    return max(volume_profile, key=lambda x: x[1])[0]
+
+# ── BTC корреляция ────────────────────────────────────────────
+def get_btc_change():
+    """Получаем изменение BTC за последние 15 минут через Hyperliquid"""
+    try:
+        now_ms   = int(time.time()*1000)
+        start_ms = now_ms - 20*60*1000  # 20 минут назад
+        r = requests.post("https://api.hyperliquid.xyz/info",
+            json={"type":"candleSnapshot","req":{"coin":"BTC","interval":"5m",
+                  "startTime":start_ms,"endTime":now_ms}}, timeout=8)
+        raw = r.json()
+        if isinstance(raw, list) and len(raw) >= 2:
+            price_now  = float(raw[-1]["c"])
+            price_15m  = float(raw[0]["o"])
+            chg = (price_now - price_15m) / price_15m * 100
+            return {"price": price_now, "change_15m": chg}
+    except Exception as e:
+        print(f"[BTC] error: {e}")
+    return None
+
 # ── Bull Score ────────────────────────────────────────────────
 def calculate_bull_score(current_price, candles):
     if not candles or len(candles) < 30:
@@ -294,7 +403,7 @@ def find_confluence_setup(current_price, candles, levels):
         if ask_walls: setup["reason"] += " + стена продажи"; setup["strength"]+=12
     return setup, pattern
 
-# ── Order Book (обычный, nSigFigs=5) ─────────────────────────
+# ── Order Book ────────────────────────────────────────────────
 def get_order_book():
     try:
         r = requests.post("https://api.hyperliquid.xyz/info",
@@ -311,12 +420,7 @@ def get_order_book():
         print(f"[OrderBook] error: {e}")
         return None
 
-# ── Глубокий Order Book (nSigFigs=4, шаг $0.1) ───────────────
 def get_deep_order_book():
-    """
-    nSigFigs=4 группирует заявки по $0.1 — видны уровни на $0.5-3 от цены.
-    Фильтрует маркет-мейкерский шум, показывает реальные стены.
-    """
     try:
         r = requests.post("https://api.hyperliquid.xyz/info",
             json={"type":"l2Book","coin":"HYPE","nSigFigs":4}, timeout=10)
@@ -327,7 +431,6 @@ def get_deep_order_book():
                       key=lambda x: x[0], reverse=True)
         asks = sorted([(float(a["px"]),float(a["sz"])) for a in levels[1]],
                       key=lambda x: x[0])
-        print(f"[DeepBook] биды: {len(bids)}, аски: {len(asks)}")
         return {"bids":bids,"asks":asks}
     except Exception as e:
         print(f"[DeepBook] error: {e}")
@@ -340,7 +443,7 @@ def find_walls(levels, threshold_multiplier=3.0):
     return sorted([(p,s) for p,s in levels if s>=avg*threshold_multiplier],
                   key=lambda x: x[1], reverse=True)
 
-# ── Быстрые снимки (каждые 8 сек, макс 75) ───────────────────
+# ── Быстрые снимки ───────────────────────────────────────────
 def take_fast_snapshot(book):
     if not book: return
     with _fast_snap_lock:
@@ -367,9 +470,8 @@ def calculate_average_book():
         "asks": {p: v/n for p,v in ask_vol.items()},
     }
 
-# ── Глубокие снимки (каждые 15 сек, макс 720 = 3 часа) ───────
+# ── Глубокие снимки ──────────────────────────────────────────
 def take_deep_snapshot(book):
-    """Снимок глубокого стакана (nSigFigs=4) каждые 15 сек"""
     if not book: return
     with _deep_snap_lock:
         snap = {
@@ -382,7 +484,6 @@ def take_deep_snapshot(book):
             _deep_snapshots.pop(0)
 
 def calculate_deep_average_book():
-    """Усредняем все глубокие снимки — шум исчезает, стены остаются"""
     with _deep_snap_lock:
         snaps = list(_deep_snapshots)
     if not snaps: return None, 0
@@ -396,7 +497,7 @@ def calculate_deep_average_book():
         "asks": {p: v/n for p,v in ask_vol.items()},
     }, n
 
-# ── Долгоживущие стены (каждые 30 сек, 4 часа) ───────────────
+# ── Долгоживущие стены ───────────────────────────────────────
 def track_persistent_walls(book):
     if not book: return
     now = time.time()
@@ -414,7 +515,7 @@ def track_persistent_walls(book):
                     _persistent_walls[key] = {
                         "size":size,"first_seen":now,"last_seen":now,"side":side}
 
-# ── Анализ стакана (текст) ────────────────────────────────────
+# ── Анализ стакана ────────────────────────────────────────────
 def analyze_orderbook(book):
     if not book: return None
     bids = book["bids"][:30]; asks = book["asks"][:30]
@@ -472,7 +573,7 @@ def check_walls_and_notify():
             _last_wall_alert[cid] = now
         except Exception: pass
 
-# ── Тепловая карта (быстрый стакан, ±0.8%) ───────────────────
+# ── Тепловая карта (быстрый стакан) ──────────────────────────
 def build_heatmap(book: dict, current_price: float) -> io.BytesIO:
     bids = [(float(p),float(s)) for p,s in book["bids"][:60]]
     asks = [(float(p),float(s)) for p,s in book["asks"][:60]]
@@ -511,116 +612,131 @@ def build_heatmap(book: dict, current_price: float) -> io.BytesIO:
     plt.close(fig); buf.seek(0)
     return buf
 
-# ── Глубокая тепловая карта (±5%, шаг $0.1, 3 часа памяти) ──
+# ── Глубокая тепловая карта ───────────────────────────────────
 def build_deep_heatmap(avg_book: dict, current_price: float, n_snaps: int) -> io.BytesIO:
-    """
-    Строит тепловую карту глубокого стакана.
-    Диапазон ±5% — видны уровни на $1-3 от цены.
-    Благодаря усреднению 720 снимков шум исчезает.
-    """
-    # Конвертируем словарь в отсортированные списки
     bids_raw = sorted([(float(p),float(s)) for p,s in avg_book["bids"].items()],
                       key=lambda x: x[0], reverse=True)
     asks_raw = sorted([(float(p),float(s)) for p,s in avg_book["asks"].items()],
                       key=lambda x: x[0])
-
-    # Фильтруем только уровни в диапазоне ±5% от текущей цены
     price_range = current_price * 0.05
     bids = [(p,s) for p,s in bids_raw if current_price-price_range <= p <= current_price]
     asks = [(p,s) for p,s in asks_raw if current_price <= p <= current_price+price_range]
-
     if not bids and not asks:
-        # Fallback — берём всё что есть
-        bids = bids_raw[:40]
-        asks = asks_raw[:40]
-
+        bids = bids_raw[:40]; asks = asks_raw[:40]
     BG,TEXT,UP,DOWN,WALL = '#131722','#d1d4dc','#26a69a','#ef5350','#f0c040'
     fig, ax = plt.subplots(figsize=(12,9), facecolor=BG)
     ax.set_facecolor(BG)
     ax.tick_params(colors=TEXT, labelsize=9)
     for sp in ax.spines.values(): sp.set_color('#2a2e39')
-
     all_sizes = [s for _,s in bids+asks]
     if not all_sizes:
-        plt.close(fig)
-        raise ValueError("Нет данных для глубокой тепловой карты")
-
+        plt.close(fig); raise ValueError("Нет данных")
     avg_size = sum(all_sizes)/len(all_sizes)
     max_size = max(all_sizes)
-
-    # Высота бара — шаг $0.1 (nSigFigs=4)
     bar_h = 0.08
-
     for p,s in asks:
-        color = WALL if s >= avg_size*2.5 else DOWN
-        ax.barh(p, s, height=bar_h, color=color, alpha=0.85, zorder=3)
-
+        ax.barh(p,s,height=bar_h,color=WALL if s>=avg_size*2.5 else DOWN,alpha=0.85,zorder=3)
     for p,s in bids:
-        color = WALL if s >= avg_size*2.5 else UP
-        ax.barh(p, s, height=bar_h, color=color, alpha=0.85, zorder=3)
-
-    # Линия текущей цены
-    ax.axhline(current_price, color=WALL, linewidth=2.0, linestyle='--', zorder=5)
-    ax.text(max_size*0.97, current_price+0.04,
-            f' ${current_price:.2f} ← Текущая',
-            color=WALL, fontsize=11, va='bottom', fontweight='bold')
-
+        ax.barh(p,s,height=bar_h,color=WALL if s>=avg_size*2.5 else UP,alpha=0.85,zorder=3)
+    ax.axhline(current_price,color=WALL,linewidth=2.0,linestyle='--',zorder=5)
+    ax.text(max_size*0.97,current_price+0.04,f' ${current_price:.2f} ← Текущая',
+            color=WALL,fontsize=11,va='bottom',fontweight='bold')
     ax.set_ylim(current_price-price_range, current_price+price_range)
     ax.set_xlim(0, max_size*1.2)
-    ax.yaxis.grid(True, color='#1e2638', linewidth=0.5, zorder=0)
-    ax.set_xlabel('Объём (HYPE)', color=TEXT, fontsize=10)
-    ax.set_ylabel('Цена ($)',     color=TEXT, fontsize=10)
-
-    hours = round(n_snaps*15/3600, 1)
+    ax.yaxis.grid(True,color='#1e2638',linewidth=0.5,zorder=0)
+    ax.set_xlabel('Объём (HYPE)',color=TEXT,fontsize=10)
+    ax.set_ylabel('Цена ($)',    color=TEXT,fontsize=10)
+    hours = round(n_snaps*15/3600,1)
     ax.set_title(
         f'🔭 Глубокий стакан HYPE  •  {n_snaps} снимков ({hours}ч памяти)  •  шаг $0.1\n'
         f'🟢 Покупки    🔴 Продажи    🟡 Стена (2.5x среднего)    диапазон ±5%',
-        color=TEXT, fontsize=10, loc='left', pad=8)
-
-    # Подписываем топ-7 крупнейших уровней
-    for p,s in sorted(bids+asks, key=lambda x: x[1], reverse=True)[:7]:
-        ax.annotate(f'{s:,.0f}', xy=(s,p), xytext=(5,0),
-                    textcoords='offset points', color=TEXT, fontsize=8,
-                    va='center', fontweight='bold')
-
+        color=TEXT,fontsize=10,loc='left',pad=8)
+    for p,s in sorted(bids+asks,key=lambda x:x[1],reverse=True)[:7]:
+        ax.annotate(f'{s:,.0f}',xy=(s,p),xytext=(5,0),
+                    textcoords='offset points',color=TEXT,fontsize=8,va='center',fontweight='bold')
     plt.tight_layout(pad=1.0)
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=130, facecolor=BG)
+    fig.savefig(buf,format='png',dpi=130,facecolor=BG)
     plt.close(fig); buf.seek(0)
     return buf
 
-# ── График свечей ─────────────────────────────────────────────
+# ── График свечей (EMA + RSI панель + Volume Profile) ─────────
 def build_chart(candles, price):
     o=[c['o'] for c in candles]; h=[c['h'] for c in candles]
     l=[c['l'] for c in candles]; cl=[c['c'] for c in candles]
     v=[c['v'] for c in candles]
     t=[datetime.fromtimestamp(c['t']/1000,tz=timezone.utc) for c in candles]
     n = len(candles)
-    chart_price = cl[-1]  # из последней свечи — совпадает с графиком
+    chart_price = cl[-1]
+
+    # EMA
+    ema20 = calculate_ema(cl, 20)
+    ema50 = calculate_ema(cl, 50)
+
+    # RSI серия
+    rsi_series = calculate_rsi_series(cl)
+
+    # Volume Profile
+    vp = calculate_volume_profile(candles, bins=25)
+    poc = get_poc(vp)
+
     BG,GRID,UP,DOWN,TEXT,PL = '#131722','#1e2638','#26a69a','#ef5350','#d1d4dc','#f0c040'
-    fig = plt.figure(figsize=(12,7), facecolor=BG)
-    ax  = fig.add_axes([0.02,0.18,0.84,0.72], facecolor=BG)
-    av  = fig.add_axes([0.02,0.05,0.84,0.11], facecolor=BG)
-    for a in (ax,av):
-        a.tick_params(colors=TEXT, labelsize=8)
+    EMA20_C = '#f9a825'   # жёлтый
+    EMA50_C = '#7c4dff'   # фиолетовый
+    RSI_C   = '#29b6f6'   # голубой
+    VP_C    = '#37474f'   # серый для Volume Profile
+
+    # Сетка: свечи (большая) | volume profile (узкая) + RSI снизу + объём
+    fig = plt.figure(figsize=(14, 9), facecolor=BG)
+    gs  = gridspec.GridSpec(
+        3, 2,
+        height_ratios=[4, 1, 1],
+        width_ratios=[5, 1],
+        hspace=0.04, wspace=0.01,
+        left=0.02, right=0.92, top=0.93, bottom=0.06
+    )
+
+    ax_c  = fig.add_subplot(gs[0, 0], facecolor=BG)   # свечи
+    ax_vp = fig.add_subplot(gs[0, 1], facecolor=BG)   # volume profile
+    ax_r  = fig.add_subplot(gs[1, 0], facecolor=BG)   # RSI
+    ax_v  = fig.add_subplot(gs[2, 0], facecolor=BG)   # объём
+
+    for a in (ax_c, ax_vp, ax_r, ax_v):
+        a.tick_params(colors=TEXT, labelsize=7)
         for sp in a.spines.values(): sp.set_color(GRID)
+
+    # ── Свечи ──
     for i,(oi,hi,li,ci,vi) in enumerate(zip(o,h,l,cl,v)):
         col = UP if ci>=oi else DOWN
-        ax.add_patch(Rectangle((i-.3,min(oi,ci)),.6,max(abs(ci-oi),.001),color=col,zorder=3))
-        ax.plot([i,i],[li,min(oi,ci)],color=col,linewidth=1,zorder=2)
-        ax.plot([i,i],[max(oi,ci),hi],color=col,linewidth=1,zorder=2)
-        av.add_patch(Rectangle((i-.3,0),.6,vi,
-                     color='#1a4a47' if ci>=oi else '#4a1a1a',zorder=2))
+        ax_c.add_patch(Rectangle((i-.3,min(oi,ci)),.6,max(abs(ci-oi),.001),color=col,zorder=3))
+        ax_c.plot([i,i],[li,min(oi,ci)],color=col,linewidth=1,zorder=2)
+        ax_c.plot([i,i],[max(oi,ci),hi],color=col,linewidth=1,zorder=2)
+        ax_v.add_patch(Rectangle((i-.3,0),.6,vi,
+                       color='#1a4a47' if ci>=oi else '#4a1a1a',zorder=2))
+
+    # ── EMA линии ──
+    xs = list(range(n))
+    ema20_vals = [(i,e) for i,e in enumerate(ema20) if e is not None]
+    ema50_vals = [(i,e) for i,e in enumerate(ema50) if e is not None]
+    if ema20_vals:
+        ax_c.plot([x for x,_ in ema20_vals],[y for _,y in ema20_vals],
+                  color=EMA20_C,linewidth=1.2,zorder=4,label='EMA20')
+    if ema50_vals:
+        ax_c.plot([x for x,_ in ema50_vals],[y for _,y in ema50_vals],
+                  color=EMA50_C,linewidth=1.2,zorder=4,label='EMA50',linestyle='--')
+    ax_c.legend(loc='upper left',fontsize=7,facecolor=BG,labelcolor=TEXT,framealpha=0.7)
+
+    # ── Pivot уровни ──
     levels = get_pivot_levels()
     if levels:
         pp_pad = (max(h)-min(l))*0.05
         ymin,ymax = min(l)-pp_pad, max(h)+pp_pad
         def draw_level(val,color,label,ls='--',lw=0.8):
             if ymin<=val<=ymax:
-                ax.axhline(val,color=color,linewidth=lw,linestyle=ls,zorder=3,alpha=0.8)
-                ax.text(n+0.5,val,label,color=color,fontsize=7.5,va='center',
-                        bbox=dict(boxstyle='round,pad=0.2',facecolor='#131722',
-                                  edgecolor=color,alpha=0.85))
+                ax_c.axhline(val,color=color,linewidth=lw,linestyle=ls,zorder=3,alpha=0.8)
+                ax_c.text(n+0.3,val,label,color=color,fontsize=7,va='center',
+                          bbox=dict(boxstyle='round,pad=0.2',facecolor='#131722',
+                                    edgecolor=color,alpha=0.85))
         draw_level(levels["R2"],'#ff4444','R2',lw=1.0)
         draw_level(levels["R1"],'#ff8888','R1')
         draw_level(levels["P"], '#ffffff',' P ',ls='-',lw=1.0)
@@ -628,24 +744,82 @@ def build_chart(candles, price):
         draw_level(levels["S2"],'#44aa44','S2',lw=1.0)
         draw_level(levels["local_high"],'#ffaa00','LH',ls=':',lw=1.1)
         draw_level(levels["local_low"], '#00aaff','LL',ls=':',lw=1.1)
-    ax.axhline(chart_price,color=PL,linewidth=1,linestyle='--',zorder=4)
-    ax.text(n+0.8,chart_price,f'${chart_price:.4f}',color='#131722',fontsize=11,
-            va='center',fontweight='bold',
-            bbox=dict(boxstyle='round,pad=0.4',facecolor=PL,edgecolor='none'))
-    ax.yaxis.grid(True,color=GRID,linewidth=0.5,zorder=0)
-    av.yaxis.grid(True,color=GRID,linewidth=0.5,zorder=0)
+
+    # ── POC линия ──
+    if poc:
+        ax_c.axhline(poc,color='#ff6d00',linewidth=1.0,linestyle=':',zorder=3,alpha=0.9)
+        ax_c.text(n+0.3,poc,'POC',color='#ff6d00',fontsize=7,va='center',
+                  bbox=dict(boxstyle='round,pad=0.2',facecolor='#131722',
+                            edgecolor='#ff6d00',alpha=0.85))
+
+    # ── Цена последней свечи ──
+    ax_c.axhline(chart_price,color=PL,linewidth=1,linestyle='--',zorder=4)
+    ax_c.text(n+0.3,chart_price,f'${chart_price:.2f}',color='#131722',fontsize=9,
+              va='center',fontweight='bold',
+              bbox=dict(boxstyle='round,pad=0.3',facecolor=PL,edgecolor='none'))
+
+    ax_c.yaxis.grid(True,color=GRID,linewidth=0.5,zorder=0)
+    pp_pad = (max(h)-min(l))*0.05
+    ax_c.set_xlim(-1,n+2); ax_c.set_ylim(min(l)-pp_pad,max(h)+pp_pad)
+    ax_c.set_xticks([])
+    ax_c.yaxis.set_label_position('right'); ax_c.yaxis.tick_right()
+
+    # ── Volume Profile (горизонтальная гистограмма) ──
+    if vp:
+        vp_prices = [p for p,_ in vp]
+        vp_vols   = [vol for _,vol in vp]
+        max_vp    = max(vp_vols) if vp_vols else 1
+        bar_h_vp  = (max(h)-min(l))/len(vp)*0.85
+        for pv,vol in vp:
+            color = '#ff6d00' if poc and abs(pv-poc)<bar_h_vp else VP_C
+            ax_vp.barh(pv, vol/max_vp, height=bar_h_vp,
+                       color=color, alpha=0.7, zorder=2)
+        ax_vp.set_ylim(min(l)-pp_pad, max(h)+pp_pad)
+        ax_vp.set_xlim(0,1.3)
+        ax_vp.set_xticks([]); ax_vp.set_yticks([])
+        ax_vp.set_title('VP',color=TEXT,fontsize=7,pad=2)
+        if poc:
+            ax_vp.axhline(poc,color='#ff6d00',linewidth=1.0,linestyle=':',zorder=3)
+
+    # ── RSI панель ──
+    rsi_xs = [i for i,r in enumerate(rsi_series) if r is not None]
+    rsi_ys = [r for r in rsi_series if r is not None]
+    if rsi_xs:
+        ax_r.plot(rsi_xs, rsi_ys, color=RSI_C, linewidth=1.2, zorder=3)
+        ax_r.axhline(70, color='#ef5350', linewidth=0.7, linestyle='--', alpha=0.7)
+        ax_r.axhline(30, color='#26a69a', linewidth=0.7, linestyle='--', alpha=0.7)
+        ax_r.fill_between(rsi_xs, rsi_ys, 70,
+                           where=[r>70 for r in rsi_ys],
+                           color='#ef5350', alpha=0.15)
+        ax_r.fill_between(rsi_xs, rsi_ys, 30,
+                           where=[r<30 for r in rsi_ys],
+                           color='#26a69a', alpha=0.15)
+        # Текущее значение RSI
+        cur_rsi = rsi_ys[-1]
+        rsi_color = '#ef5350' if cur_rsi>70 else '#26a69a' if cur_rsi<30 else TEXT
+        ax_r.text(n+0.3, cur_rsi, f'{cur_rsi:.0f}',
+                  color=rsi_color, fontsize=7, va='center')
+    ax_r.set_xlim(-1,n+2); ax_r.set_ylim(0,100)
+    ax_r.set_yticks([30,70]); ax_r.set_xticks([])
+    ax_r.yaxis.set_label_position('right'); ax_r.yaxis.tick_right()
+    ax_r.text(-0.5, 50, 'RSI', color=TEXT, fontsize=7, va='center')
+    ax_r.yaxis.grid(True,color=GRID,linewidth=0.5,zorder=0)
+
+    # ── Объём ──
+    ax_v.yaxis.grid(True,color=GRID,linewidth=0.5,zorder=0)
     step = max(1,n//8)
     xt   = list(range(0,n,step))
-    ax.set_xticks([]); av.set_xticks(xt)
-    av.set_xticklabels([t[i].strftime('%H:%M') for i in xt],color=TEXT,fontsize=7)
-    pp_pad = (max(h)-min(l))*0.05
-    ax.set_xlim(-1,n+3); ax.set_ylim(min(l)-pp_pad,max(h)+pp_pad)
-    av.set_xlim(-1,n+3); av.set_ylim(0,max(v)*1.3)
-    ax.yaxis.set_label_position('right'); ax.yaxis.tick_right()
-    av.yaxis.set_label_position('right'); av.yaxis.tick_right()
+    ax_v.set_xticks(xt)
+    ax_v.set_xticklabels([t[i].strftime('%H:%M') for i in xt],color=TEXT,fontsize=7)
+    ax_v.set_xlim(-1,n+2); ax_v.set_ylim(0,max(v)*1.3)
+    ax_v.yaxis.set_label_position('right'); ax_v.yaxis.tick_right()
+
     chg = (cl[-1]-o[0])/o[0]*100
-    ax.set_title(f"HYPE/USDC  •  5м  •  6ч       {'+' if chg>=0 else ''}{chg:.2f}%",
-                 color=TEXT,fontsize=11,loc='left',pad=8,fontweight='bold')
+    fig.suptitle(
+        f"HYPE/USDC  •  5м  •  6ч       {'+' if chg>=0 else ''}{chg:.2f}%"
+        f"   EMA20/50   RSI   Volume Profile",
+        color=TEXT, fontsize=10, fontweight='bold', x=0.02, ha='left')
+
     buf = io.BytesIO()
     fig.savefig(buf,format='png',dpi=130,facecolor=BG)
     plt.close(fig); buf.seek(0)
@@ -669,6 +843,24 @@ def cmd_price(message):
     levels  = get_pivot_levels()
     bull_score, sentiment, confidence = 50, "Нейтральный", "50%"
     setup_text = ""
+
+    # BTC корреляция
+    btc = get_btc_change()
+    btc_text = ""
+    if btc:
+        btc_sign = "+" if btc["change_15m"]>=0 else ""
+        btc_em   = "🟢" if btc["change_15m"]>0 else "🔴"
+        btc_text = f"\n{btc_em} BTC за 15м: `{btc_sign}{btc['change_15m']:.2f}%` (`${btc['price']:,.0f}`)"
+
+    # RSI дивергенция
+    div_text = ""
+    if candles and len(candles)>20:
+        div = detect_rsi_divergence(candles)
+        if div == "bullish":
+            div_text = "\n\n⚡ *Бычья дивергенция RSI* — цена падала, RSI рос → возможный разворот вверх"
+        elif div == "bearish":
+            div_text = "\n\n⚠️ *Медвежья дивергенция RSI* — цена росла, RSI падал → возможный разворот вниз"
+
     if candles and len(candles)>25:
         bull_score, sentiment, confidence = calculate_bull_score(data["price"], candles)
         setup, _ = find_confluence_setup(data["price"], candles, levels)
@@ -677,16 +869,29 @@ def cmd_price(message):
                           f"*{setup['direction']}* — Сила: {setup['strength']}/100\n"
                           f"Уровень: {setup['level']}\n"
                           f"Причина: {setup['reason']}")
+
+    # Volume Profile POC
+    poc_text = ""
+    if candles:
+        vp  = calculate_volume_profile(candles)
+        poc = get_poc(vp)
+        if poc:
+            poc_text = f"\n🟠 POC (макс. объём): `${poc:.2f}`"
+
     levels_text = ""
     if levels:
         levels_text = (f"\n\n📊 *Уровни:*\n"
                        f"R2:`${levels['R2']:.2f}` R1:`${levels['R1']:.2f}`\n"
-                       f"P:`${levels['P']:.2f}` S1:`${levels['S1']:.2f}`")
+                       f"P:`${levels['P']:.2f}` S1:`${levels['S1']:.2f}`"
+                       f"{poc_text}")
+
     forecast = f"\n\n🔮 *Прогноз 1-4ч*: *{sentiment}* (Bull Score: {bull_score}/100)"
     caption  = (f"💰 *HYPE / USD*\n\n"
                 f"Цена: `${data['price']:.4f}`\n"
                 f"Изм.24ч: {em} `{s}{data['change_24h']:.2f}%`"
-                f"{forecast}{levels_text}{setup_text}")
+                f"{btc_text}"
+                f"{forecast}{levels_text}{div_text}{setup_text}")
+
     if candles:
         try:
             bot.send_photo(message.chat.id,
@@ -767,15 +972,12 @@ def cmd_deep_orderbook(message):
     avg_book, n_snaps = calculate_deep_average_book()
     if not avg_book or n_snaps < 4:
         bot.send_message(message.chat.id,
-            "⏳ Глубокий стакан ещё накапливает данные.\n\n"
-            f"Накоплено: *{n_snaps}* снимков из 720 (нужно хотя бы 4).\n"
-            "Попробуй через минуту.",
+            f"⏳ Накоплено: *{n_snaps}* снимков из 720. Попробуй через минуту.",
             parse_mode="Markdown")
         return
 
     bot.send_message(message.chat.id,"⏳ Строю глубокую тепловую карту...")
 
-    # Текстовый анализ глубокого стакана
     all_bids = sorted([(float(p),float(s)) for p,s in avg_book["bids"].items()],
                       key=lambda x: x[0], reverse=True)
     all_asks = sorted([(float(p),float(s)) for p,s in avg_book["asks"].items()],
@@ -796,27 +998,21 @@ def cmd_deep_orderbook(message):
     if deep_ask_walls:
         text += "🔴 *Значимые стены продажи:*\n"
         for p,s in deep_ask_walls[:4]:
-            dist = p-mid_price
-            text += f"  `${p:.1f}` (+${dist:.1f}) — {s:,.0f} HYPE\n"
-
+            text += f"  `${p:.1f}` (+${p-mid_price:.1f}) — {s:,.0f} HYPE\n"
     if deep_bid_walls:
         text += "\n🟢 *Значимые стены покупки:*\n"
         for p,s in deep_bid_walls[:4]:
-            dist = mid_price-p
-            text += f"  `${p:.1f}` (-${dist:.1f}) — {s:,.0f} HYPE\n"
-
+            text += f"  `${p:.1f}` (-${mid_price-p:.1f}) — {s:,.0f} HYPE\n"
     if not deep_ask_walls and not deep_bid_walls:
-        text += "_Значимых стен пока не обнаружено.\nДанные накапливаются..._"
+        text += "_Значимых стен пока не обнаружено._"
 
     bot.send_message(message.chat.id,text,parse_mode="Markdown")
 
-    # Глубокая тепловая карта
     try:
         heatmap = build_deep_heatmap(avg_book, mid_price, n_snaps)
         bot.send_photo(message.chat.id, heatmap,
                        caption=(f"🔭 *Глубокая тепловая карта*\n"
-                                f"Диапазон ±5% от цены • {hours}ч памяти • шаг $0.1\n"
-                                f"Жёлтые уровни = стены которые стоят уже давно"),
+                                f"Диапазон ±5% • {hours}ч памяти • шаг $0.1"),
                        parse_mode="Markdown")
     except Exception as e:
         print(f"[DeepHeatmap] error: {e}")
@@ -856,8 +1052,7 @@ def cmd_bull_notify(message):
         save_subscribers()
         bot.send_message(cid,
             "✅ *Bull Score уведомления включены!*\n\n"
-            "Пришлю сигнал когда Bull Score HYPE превысит *60/100* — "
-            "это означает что рынок склоняется к росту.",
+            "Пришлю сигнал когда Bull Score HYPE превысит *60/100*.",
             parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "❌ Отписаться")
@@ -878,25 +1073,54 @@ def cmd_unsub(message):
 def cmd_help(message):
     bot.send_message(message.chat.id,
         "📖 *Как пользоваться ботом*\n\n"
-        "💰 *Курс HYPE* — цена + график 5м за 6ч + уровни + прогноз\n"
+        "💰 *Курс HYPE* — цена + график с EMA/RSI/VP + прогноз\n"
         "📊 *Статистика 24ч* — объём, капитализация\n"
-        "📖 *Стакан заявок* — анализ ±0.8% + тепловая карта (75 снимков)\n"
-        "🔭 *Глубокий стакан* — стены на ±5%, память 3ч, шаг $0.1\n"
+        "📖 *Стакан заявок* — анализ ±0.8% + тепловая карта\n"
+        "🔭 *Глубокий стакан* — стены ±5%, память 3ч, шаг $0.1\n"
         "🔔 *Уведомления 1%* — сигнал при движении 1%+ за 15 мин\n"
-        "🐂 *Bull Score 60+* — сигнал когда рынок склоняется к росту\n"
+        "🐂 *Bull Score 60+* — сигнал при бычьем настроении\n"
         "❌ *Отписаться* — выключить все уведомления\n\n"
-        "📊 *Уровни:*\n"
-        "R2/R1 — сопротивления | S1/S2 — поддержки\n"
-        "P — центральный пивот | LH/LL — локальные экстремумы\n"
-        "🧱 — крупная стена в стакане\n\n"
-        "_Стакан: снимки каждые 8-15 сек, глубокий — 3ч памяти_")
+        "📈 *На графике:*\n"
+        "🟡 EMA20 — быстрая скользящая | 🟣 EMA50 — медленная\n"
+        "🟠 POC — уровень максимального объёма за 6ч\n"
+        "RSI панель — перекупленность (>70) / перепроданность (<30)\n"
+        "VP — Volume Profile справа от свечей\n\n"
+        "📊 *Уровни:* R2/R1 сопротивления | S1/S2 поддержки | P пивот")
 
 @bot.message_handler(func=lambda m: True)
 def fallback(message):
     bot.send_message(message.chat.id,"🤔 Воспользуйся кнопками ниже.",
                      reply_markup=main_markup())
 
-# ── Поток 1: быстрые снимки (каждые 8 сек, макс 75) ─────────
+# ── Алерт дивергенции ─────────────────────────────────────────
+_last_div_alert: dict = {}
+
+def check_divergence_and_notify():
+    """Алерт если обнаружена RSI дивергенция"""
+    candles = get_candles(6)
+    if not candles or len(candles) < 20: return
+    data = get_cached()
+    if not data: return
+    div = detect_rsi_divergence(candles)
+    if not div: return
+    now = time.time()
+    if div == "bullish":
+        msg = (f"⚡ *Бычья дивергенция RSI*\n\n"
+               f"Цена падала, RSI рос — возможный разворот вверх.\n"
+               f"Цена HYPE: `${data['price']:.4f}`")
+    else:
+        msg = (f"⚠️ *Медвежья дивергенция RSI*\n\n"
+               f"Цена росла, RSI падал — возможный разворот вниз.\n"
+               f"Цена HYPE: `${data['price']:.4f}`")
+    for cid in list(subscribers):
+        key = f"{cid}_{div}"
+        if now - _last_div_alert.get(key, 0) < 7200: continue
+        try:
+            bot.send_message(cid, msg)
+            _last_div_alert[key] = now
+        except Exception: pass
+
+# ── Потоки ────────────────────────────────────────────────────
 def fast_snapshot_loop():
     print("[FastSnap] Запуск...")
     while True:
@@ -907,7 +1131,6 @@ def fast_snapshot_loop():
             print(f"[FastSnap] error: {e}")
         time.sleep(8)
 
-# ── Поток 2: глубокие снимки (каждые 15 сек, 3 часа) ────────
 def deep_snapshot_loop():
     print("[DeepSnap] Запуск...")
     while True:
@@ -918,7 +1141,6 @@ def deep_snapshot_loop():
             print(f"[DeepSnap] error: {e}")
         time.sleep(15)
 
-# ── Поток 3: долгие стены (каждые 30 сек) ────────────────────
 def wall_track_loop():
     print("[WallTrack] Запуск...")
     while True:
@@ -929,7 +1151,6 @@ def wall_track_loop():
             print(f"[WallTrack] error: {e}")
         time.sleep(30)
 
-# ── Поток 4: цена + алерты (каждую минуту) ───────────────────
 _last_bull_alert: dict = {}
 
 def price_monitor():
@@ -942,6 +1163,7 @@ def price_monitor():
         print(f"[Monitor] Кэш: ${data['price']:.4f}")
 
     wall_counter = 0
+    div_counter  = 0
     while True:
         time.sleep(60)
         data = _fetch_hype()
@@ -997,14 +1219,20 @@ def price_monitor():
             try: check_walls_and_notify()
             except Exception as e: print(f"[Walls] error: {e}")
 
-# ── Запуск всех потоков ───────────────────────────────────────
+        # Алерт дивергенции раз в 15 минут
+        div_counter += 1
+        if div_counter>=15 and subscribers:
+            div_counter = 0
+            try: check_divergence_and_notify()
+            except Exception as e: print(f"[Div] error: {e}")
+
+# ── Запуск ────────────────────────────────────────────────────
 load_subscribers()
 threading.Thread(target=fast_snapshot_loop,  daemon=True).start()
 threading.Thread(target=deep_snapshot_loop,  daemon=True).start()
 threading.Thread(target=wall_track_loop,     daemon=True).start()
 threading.Thread(target=price_monitor,       daemon=True).start()
 
-# ── Flask / polling ───────────────────────────────────────────
 print("✅ Бот запущен...")
 if DOMAIN:
     webhook_url = f"https://{DOMAIN}/{TOKEN}"
